@@ -1,0 +1,7 @@
+{
+  "name": "CromoForge",
+  "description": "Agente de despliegue: pull de imagen OCI, reconciliacion y rollback automatico",
+  "type": "rust",
+  "role": "agent",
+  "start": "cargo run"
+}

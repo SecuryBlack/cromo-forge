@@ -170,11 +170,17 @@ un mensaje de estado deseado. `DeployLog` y `DeployStatus` sí sirven casi enter
 ## Siguientes pasos
 
 - [ ] Cerrar las tres decisiones abiertas de arriba.
-- [ ] Escribir `README.md` + roadmap por fases en el formato de `nexus-agent` / `oxi-pulse`.
+- [x] Escribir `README.md` en el formato de `nexus-agent` / `oxi-pulse`. Hecho 2026-08-23.
 - [ ] Definir el contrato de estado deseado (manifiesto): mismo esquema para las tres `source`.
 - [ ] Definir los mensajes de deploy sobre el Conduit Protocol
       (`nexus-agent/proto/tunnel/v1/tunnel.proto`) y cómo CromoForge se anuncia en el `registry` de Nexus.
-- [ ] Esqueleto de repo igual que los hermanos: `sb-service.json`, `scripts/install.sh|ps1`,
-      `.github/workflows/release.yml` cross-platform, auto-update vía `self_update`, `LICENSE` (Apache 2.0).
+- [x] Esqueleto de repo igual que los hermanos: `sb-service.json`, `scripts/install.sh|ps1`,
+      `.github/workflows/release.yml` (llamando al reutilizable de `sb-agent-core`), `LICENSE`
+      (Apache 2.0). Hecho 2026-08-23 — `Cargo.toml` depende de `sb-agent-core` por git (todavía
+      sin publicar en crates.io) y `src/main.rs` ya usa config/logging/service/updater/status del
+      crate compartido. Compila limpio. **El reconciliador real no existe** — el loop principal
+      es un placeholder que solo demuestra que el ciclo de vida (arranca, carga config, expone
+      status, apaga limpio) funciona de punta a punta. Eso es lo próximo, y depende de cerrar el
+      contrato de estado deseado primero.
 - [ ] Modelo de datos en `api-internal`: reutilizar `agents` (`agent_type = "cromoforge"`) y
       diseñar tablas de apps / deploys / secretos sellados.
