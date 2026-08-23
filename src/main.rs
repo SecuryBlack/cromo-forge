@@ -24,7 +24,7 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
         .parent()
         .expect("config path always has a parent")
         .to_path_buf();
-    logging::init(AGENT_NAME, &log_dir);
+    logging::init(AGENT_NAME, &log_dir, "info");
 
     let version = env!("CARGO_PKG_VERSION");
     info!("CromoForge v{version} starting");
