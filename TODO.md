@@ -152,6 +152,56 @@ un mensaje de estado deseado. `DeployLog` y `DeployStatus` sí sirven casi enter
 
 ---
 
+### 6. Contrato de estado deseado (añadido 2026-08-23)
+
+> **Un único esquema TOML, el mismo para las tres `source`.** Cambia de dónde
+> sale, no su forma: `securyblack` lo manda por Conduit (como mensaje
+> `DesiredState`, ver más abajo), `git` lo lee de un fichero en el repo del
+> cliente, `local` lo edita el usuario a mano en disco.
+
+```toml
+[app]
+name  = "my-app"
+image = "ghcr.io/org/my-app:1.4.2"   # ref OCI — tag inmutable o digest, nunca "latest"
+container_port = 8080
+
+[health_check]
+path              = "/healthz"
+interval_secs     = 10
+timeout_secs      = 3
+failure_threshold = 3                 # nº de fallos consecutivos antes de rollback
+
+[rollout]
+strategy            = "recreate"      # único valor en v1 — un contenedor, un servidor
+rollback_on_failure  = true
+
+[env]
+# variables de entorno no sensibles, en claro
+NODE_ENV = "production"
+
+[secrets]
+# selladas con X25519 contra la clave pública de esta instalación — SB no puede
+# leerlas ni aunque comprometan su base de datos. Formato: base64 del ciphertext.
+DATABASE_URL = "sealed:AbCdEf...=="
+```
+
+**Por qué este reparto de campos:**
+- `image` como ref OCI, nunca build-in-place — coherente con la decisión de build ya cerrada.
+- `health_check` + `rollback_on_failure` son los campos que existen precisamente para la
+  "pieza a clavar" (rollback automático) — sin ellos el reconciliador no tiene con qué decidir.
+- `secrets` separado de `env` en el fichero, no como convención de prefijo — para que sea
+  imposible mezclar un secreto en texto plano por error de copy-paste.
+- `strategy = "recreate"` es el único valor soportado en v1 a propósito (ver alcance v1);
+  el campo existe ya para no tener que romper el esquema cuando llegue blue/green en v2+.
+
+**Consecuencia para el proto de Nexus:** `DeployCommand`/`GitPullAction`/`DockerBuildAction`/
+`DockerComposeAction` quedan reemplazados por un mensaje `DesiredState` que espeja este TOML
+campo a campo. Ver el detalle en `nexus-agent/proto/tunnel/v1/tunnel.proto` (rediseñado
+2026-08-23) — esos cuatro mensajes no tenían ni un solo uso en `src/`, así que el cambio no
+rompe nada existente.
+
+---
+
 ## Abierto — decidir antes de escribir código
 
 - [ ] **Registry.** ¿GHCR (gratis, ya en uso, obliga a cuenta GitHub) o registry propio de SB
