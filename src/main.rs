@@ -9,6 +9,7 @@
 //! ciclo de vida completo (arranca, carga config, expone status, apaga
 //! limpio) funciona de punta a punta.
 
+mod commands;
 mod config;
 
 use config::Config;
@@ -40,6 +41,13 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
 
     let status_handle = status::StatusHandle::new(AGENT_NAME, version);
     status::spawn_server(status_handle.clone(), status::default_socket_path(AGENT_NAME));
+
+    let command_registry = sb_agent_core::command_intake::CommandRegistry::new();
+    commands::register(&command_registry);
+    sb_agent_core::command_intake::spawn_server(
+        command_registry,
+        sb_agent_core::command_intake::default_socket_path(AGENT_NAME),
+    );
 
     updater::start_daily_check(updater::UpdaterConfig::new(
         "securyblack",
