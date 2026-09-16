@@ -1,6 +1,6 @@
 [package]
 name = "cromoforge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Deploy agent for SecuryBlack — pulls an OCI image and reconciles a server's running container against a desired state"

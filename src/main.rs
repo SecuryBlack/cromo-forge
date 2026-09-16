@@ -40,7 +40,10 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
     info!(source = %cfg.source, poll_interval_secs = cfg.poll_interval_secs, "config loaded");
 
     let status_handle = status::StatusHandle::new(AGENT_NAME, version);
-    status::spawn_server(status_handle.clone(), status::default_socket_path(AGENT_NAME));
+    status::spawn_server(
+        status_handle.clone(),
+        status::default_socket_path(AGENT_NAME),
+    );
 
     let command_registry = sb_agent_core::command_intake::CommandRegistry::new();
     commands::register(&command_registry);
@@ -62,7 +65,8 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
         "source": cfg.source,
     }));
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(cfg.poll_interval_secs));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(cfg.poll_interval_secs));
     loop {
         tokio::select! {
             _ = interval.tick() => {

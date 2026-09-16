@@ -43,6 +43,33 @@ pub fn register(registry: &CommandRegistry) {
             .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
     });
 
+    registry.register("docker_start_container", |payload, _progress| async move {
+        tokio::task::spawn_blocking(move || start_container(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
+
+    registry.register("docker_stop_container", |payload, _progress| async move {
+        tokio::task::spawn_blocking(move || stop_container(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
+
+    registry.register(
+        "docker_restart_container",
+        |payload, _progress| async move {
+            tokio::task::spawn_blocking(move || restart_container(payload))
+                .await
+                .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+        },
+    );
+
+    registry.register("docker_get_logs", |payload, _progress| async move {
+        tokio::task::spawn_blocking(move || get_container_logs(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
+
     registry.register("update_now", |_payload, _progress| async move {
         update_now::handle().await
     });
@@ -96,7 +123,9 @@ fn list_containers() -> CommandOutcome {
             installed: true,
             docker_running: false,
             containers: Vec::new(),
-            message: Some(format!("Docker daemon unreachable or returned error: {stderr}")),
+            message: Some(format!(
+                "Docker daemon unreachable or returned error: {stderr}"
+            )),
         };
         return CommandOutcome::ok(serde_json::to_string(&resp).unwrap_or_default());
     }
@@ -131,6 +160,219 @@ fn list_containers() -> CommandOutcome {
     };
 
     CommandOutcome::ok(serde_json::to_string(&resp).unwrap_or_default())
+}
+
+#[derive(Debug, Deserialize)]
+struct ContainerActionPayload {
+    container_id: String,
+    #[serde(default)]
+    timeout_secs: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetLogsPayload {
+    container_id: String,
+    #[serde(default = "default_tail")]
+    tail: u32,
+    #[serde(default = "default_true")]
+    timestamps: bool,
+    #[serde(default)]
+    since: Option<String>,
+}
+
+fn default_tail() -> u32 {
+    200
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_safe_container_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
+}
+
+fn is_safe_since(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == ':' || c == '.' || c == 'Z' || c == 'T'
+        })
+}
+
+fn start_container(payload: serde_json::Value) -> CommandOutcome {
+    let args: ContainerActionPayload = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("invalid payload: {e}")),
+    };
+
+    if !is_safe_container_id(&args.container_id) {
+        return CommandOutcome::failed("invalid container_id");
+    }
+
+    let output = match Command::new("docker")
+        .args(["start", &args.container_id])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return CommandOutcome::failed(format!("failed to execute docker start: {e}")),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return CommandOutcome::failed(format!("docker start failed: {stderr}"));
+    }
+
+    CommandOutcome::ok(
+        json!({
+            "success": true,
+            "action": "start",
+            "container_id": args.container_id
+        })
+        .to_string(),
+    )
+}
+
+fn stop_container(payload: serde_json::Value) -> CommandOutcome {
+    let args: ContainerActionPayload = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("invalid payload: {e}")),
+    };
+
+    if !is_safe_container_id(&args.container_id) {
+        return CommandOutcome::failed("invalid container_id");
+    }
+
+    let timeout = args.timeout_secs.unwrap_or(10).to_string();
+    let output = match Command::new("docker")
+        .args(["stop", "-t", &timeout, &args.container_id])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return CommandOutcome::failed(format!("failed to execute docker stop: {e}")),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return CommandOutcome::failed(format!("docker stop failed: {stderr}"));
+    }
+
+    CommandOutcome::ok(
+        json!({
+            "success": true,
+            "action": "stop",
+            "container_id": args.container_id
+        })
+        .to_string(),
+    )
+}
+
+fn restart_container(payload: serde_json::Value) -> CommandOutcome {
+    let args: ContainerActionPayload = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("invalid payload: {e}")),
+    };
+
+    if !is_safe_container_id(&args.container_id) {
+        return CommandOutcome::failed("invalid container_id");
+    }
+
+    let timeout = args.timeout_secs.unwrap_or(10).to_string();
+    let output = match Command::new("docker")
+        .args(["restart", "-t", &timeout, &args.container_id])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return CommandOutcome::failed(format!("failed to execute docker restart: {e}")),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return CommandOutcome::failed(format!("docker restart failed: {stderr}"));
+    }
+
+    CommandOutcome::ok(
+        json!({
+            "success": true,
+            "action": "restart",
+            "container_id": args.container_id
+        })
+        .to_string(),
+    )
+}
+
+fn get_container_logs(payload: serde_json::Value) -> CommandOutcome {
+    let args: GetLogsPayload = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("invalid payload: {e}")),
+    };
+
+    if !is_safe_container_id(&args.container_id) {
+        return CommandOutcome::failed("invalid container_id");
+    }
+
+    let tail_str = args.tail.clamp(1, 2000).to_string();
+    let mut cmd = Command::new("docker");
+    cmd.args(["logs", "--tail", &tail_str]);
+    if args.timestamps {
+        cmd.arg("--timestamps");
+    }
+    if let Some(ref since) = args.since {
+        if is_safe_since(since) {
+            cmd.args(["--since", since]);
+        }
+    }
+    cmd.arg(&args.container_id);
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return CommandOutcome::failed(format!("failed to execute docker logs: {e}")),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return CommandOutcome::failed(format!("docker logs failed: {stderr}"));
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    let combined_logs = if args.timestamps {
+        let mut lines: Vec<&str> = stdout_str
+            .lines()
+            .chain(stderr_str.lines())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    } else {
+        let mut res = String::with_capacity(stdout_str.len() + stderr_str.len());
+        res.push_str(&stdout_str);
+        if !stderr_str.is_empty() {
+            if !res.is_empty() && !res.ends_with('\n') {
+                res.push('\n');
+            }
+            res.push_str(&stderr_str);
+        }
+        res
+    };
+
+    let total_lines = combined_logs.lines().count();
+
+    CommandOutcome::ok(
+        json!({
+            "container_id": args.container_id,
+            "tail": args.tail,
+            "timestamps": args.timestamps,
+            "total_lines": total_lines,
+            "logs": combined_logs
+        })
+        .to_string(),
+    )
 }
 
 mod update_now {
