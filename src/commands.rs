@@ -681,7 +681,7 @@ pub struct PostgresActionArgs {
 }
 
 fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
