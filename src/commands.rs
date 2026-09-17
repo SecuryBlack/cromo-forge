@@ -73,7 +73,20 @@ pub fn register(registry: &CommandRegistry) {
     registry.register("update_now", |_payload, _progress| async move {
         update_now::handle().await
     });
+
+    registry.register("postgres_test_connection", |payload, _progress| async move {
+        tokio::task::spawn_blocking(move || postgres_test_connection(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
+
+    registry.register("postgres_collect_metrics", |payload, _progress| async move {
+        tokio::task::spawn_blocking(move || postgres_collect_metrics(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
 }
+
 
 fn list_containers() -> CommandOutcome {
     let has_docker = if cfg!(windows) {
@@ -409,3 +422,221 @@ mod update_now {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PostgreSQL Manager & Performance Insights
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PostgresCommandArgs {
+    pub container_name: Option<String>,
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_database")]
+    pub database: String,
+    #[serde(default = "default_username")]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    5432
+}
+fn default_database() -> String {
+    "postgres".to_string()
+}
+fn default_username() -> String {
+    "securyblack_monitor".to_string()
+}
+
+fn execute_psql(args: &PostgresCommandArgs, sql: &str) -> Result<String, String> {
+    if let Some(ref c) = args.container_name {
+        let trimmed = c.trim();
+        if !trimmed.is_empty() {
+            let mut cmd = Command::new("docker");
+            cmd.arg("exec");
+            if !args.password.is_empty() {
+                cmd.arg("-e").arg(format!("PGPASSWORD={}", args.password));
+            }
+            cmd.arg(trimmed)
+                .arg("psql")
+                .arg("-U")
+                .arg(&args.username)
+                .arg("-d")
+                .arg(&args.database)
+                .arg("-t")
+                .arg("-A")
+                .arg("-c")
+                .arg(sql);
+
+            let out = cmd
+                .output()
+                .map_err(|e| format!("Failed to execute docker exec: {e}"))?;
+
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(if err.is_empty() {
+                    "Postgres command failed without stderr".to_string()
+                } else {
+                    err
+                });
+            }
+            return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+    }
+
+    let mut cmd = Command::new("psql");
+    cmd.arg("-h")
+        .arg(&args.host)
+        .arg("-p")
+        .arg(args.port.to_string())
+        .arg("-U")
+        .arg(&args.username)
+        .arg("-d")
+        .arg(&args.database)
+        .arg("-t")
+        .arg("-A")
+        .arg("-c")
+        .arg(sql);
+
+    if !args.password.is_empty() {
+        cmd.env("PGPASSWORD", &args.password);
+    }
+
+    let out = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute psql on host: {e}"))?;
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            "Host psql command failed without stderr".to_string()
+        } else {
+            err
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn postgres_test_connection(payload: serde_json::Value) -> CommandOutcome {
+    let args: PostgresCommandArgs = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("Invalid arguments: {e}")),
+    };
+
+    match execute_psql(&args, "SELECT version();") {
+        Ok(v) => CommandOutcome::ok(
+            json!({
+                "success": true,
+                "version": v,
+                "message": "Connection successful"
+            })
+            .to_string(),
+        ),
+        Err(e) => CommandOutcome::ok(
+            json!({
+                "success": false,
+                "error": e,
+                "message": "Failed to connect to PostgreSQL"
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
+    let args: PostgresCommandArgs = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("Invalid arguments: {e}")),
+    };
+
+
+    // 1. Version
+    let version = match execute_psql(&args, "SELECT version();") {
+        Ok(v) => v,
+        Err(e) => {
+            return CommandOutcome::ok(
+                json!({
+                    "success": false,
+                    "error": e,
+                    "message": "PostgreSQL unreachable"
+                })
+                .to_string(),
+            );
+        }
+    };
+
+    // 2. Conexiones
+    let conn_sql = "SELECT count(*) || '|' || count(*) FILTER (WHERE state = 'active') || '|' || count(*) FILTER (WHERE state = 'idle') || '|' || count(*) FILTER (WHERE state = 'idle in transaction') || '|' || (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') FROM pg_stat_activity;";
+    let conn_stats = execute_psql(&args, conn_sql).unwrap_or_default();
+    let conn_parts: Vec<&str> = conn_stats.split('|').collect();
+    let total_conn: i64 = conn_parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let active_conn: i64 = conn_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let idle_conn: i64 = conn_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let idle_in_tx: i64 = conn_parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let max_conn: i64 = conn_parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(100);
+
+    // 3. Tamaño de base de datos y Cache Hit Ratio
+    let size_sql = "SELECT pg_database_size(current_database()) || '|' || coalesce(round(sum(blks_hit) * 100.0 / nullif(sum(blks_hit + blks_read), 0), 2), 100.0) FROM pg_stat_database WHERE datname = current_database();";
+    let size_stats = execute_psql(&args, size_sql).unwrap_or_default();
+    let size_parts: Vec<&str> = size_stats.split('|').collect();
+    let db_bytes: i64 = size_parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cache_hit_pct: f64 = size_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(100.0);
+
+    // 4. Slow queries (from pg_stat_statements)
+    let slow_queries_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT query, calls, round(total_exec_time::numeric, 2) as total_exec_time, round(mean_exec_time::numeric, 2) as mean_exec_time, round(min_exec_time::numeric, 2) as min_exec_time, round(max_exec_time::numeric, 2) as max_exec_time, rows FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10) t;";
+    let (has_stat_statements, slow_queries_json) = match execute_psql(&args, slow_queries_sql) {
+        Ok(raw) => {
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
+            (true, parsed)
+        }
+        Err(_) => (false, json!([])),
+    };
+
+    // 5. Table bloat & dead tuples
+    let bloat_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT schemaname || '.' || relname as table_name, n_live_tup, n_dead_tup, coalesce(round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2), 0) as dead_pct, pg_total_relation_size(relid) as total_bytes, to_char(last_vacuum, 'YYYY-MM-DD HH24:MI:SS') as last_vacuum, to_char(last_autovacuum, 'YYYY-MM-DD HH24:MI:SS') as last_autovacuum, to_char(last_analyze, 'YYYY-MM-DD HH24:MI:SS') as last_analyze FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 10) t;";
+    let tables_bloat_json: serde_json::Value = match execute_psql(&args, bloat_sql) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+
+    // 6. Configuración / Settings de PostgreSQL
+    let settings_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT name, setting, unit FROM pg_settings WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'effective_cache_size', 'max_connections', 'wal_buffers')) t;";
+    let settings_json: serde_json::Value = match execute_psql(&args, settings_sql) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+
+    CommandOutcome::ok(
+        json!({
+            "success": true,
+            "version": version,
+            "database_name": args.database,
+            "connections": {
+                "total": total_conn,
+                "active": active_conn,
+                "idle": idle_conn,
+                "idle_in_transaction": idle_in_tx,
+                "max": max_conn,
+                "usage_pct": if max_conn > 0 { (total_conn as f64 / max_conn as f64 * 100.0).round() } else { 0.0 }
+            },
+            "storage": {
+                "size_bytes": db_bytes,
+                "cache_hit_ratio": cache_hit_pct
+            },
+            "pg_stat_statements_installed": has_stat_statements,
+            "slow_queries": slow_queries_json,
+            "tables_bloat": tables_bloat_json,
+            "settings": settings_json
+        })
+        .to_string(),
+    )
+}
+
