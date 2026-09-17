@@ -85,6 +85,12 @@ pub fn register(registry: &CommandRegistry) {
             .await
             .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
     });
+
+    registry.register("postgres_action", |payload, _progress| async move {
+        tokio::task::spawn_blocking(move || postgres_action(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
 }
 
 
@@ -614,6 +620,27 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
         Err(_) => json!([]),
     };
 
+    // 7. Active queries (pg_stat_activity)
+    let active_queries_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT pid, usename, client_addr::text as client_ip, state, round(extract(epoch from (now() - query_start))::numeric, 2) as duration_secs, wait_event_type, wait_event, query FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state <> 'idle' ORDER BY query_start ASC LIMIT 20) t;";
+    let active_queries_json: serde_json::Value = match execute_psql(&args, active_queries_sql) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+
+    // 8. Available & installed extensions
+    let extensions_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT name, default_version, installed_version, comment FROM pg_available_extensions WHERE name IN ('pg_stat_statements', 'pgcrypto', 'uuid-ossp', 'vector', 'timescaledb', 'citext', 'pg_trgm', 'postgis', 'hstore', 'unaccent') ORDER BY name) t;";
+    let extensions_json: serde_json::Value = match execute_psql(&args, extensions_sql) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+
+    // 9. Unused indexes (> 1 MB and 0 scans)
+    let unused_indexes_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT schemaname || '.' || relname as table_name, indexrelname as index_name, pg_size_pretty(pg_relation_size(i.indexrelid)) as index_size_pretty, pg_relation_size(i.indexrelid) as index_size_bytes, idx_scan FROM pg_stat_user_indexes ui JOIN pg_index i ON ui.indexrelid = i.indexrelid WHERE NOT indisunique AND idx_scan = 0 AND pg_relation_size(i.indexrelid) > 1024 * 1024 ORDER BY pg_relation_size(i.indexrelid) DESC LIMIT 15) t;";
+    let unused_indexes_json: serde_json::Value = match execute_psql(&args, unused_indexes_sql) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| json!([])),
+        Err(_) => json!([]),
+    };
+
     CommandOutcome::ok(
         json!({
             "success": true,
@@ -634,9 +661,103 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
             "pg_stat_statements_installed": has_stat_statements,
             "slow_queries": slow_queries_json,
             "tables_bloat": tables_bloat_json,
-            "settings": settings_json
+            "settings": settings_json,
+            "active_queries": active_queries_json,
+            "installed_extensions": extensions_json,
+            "unused_indexes": unused_indexes_json
         })
         .to_string(),
     )
 }
+
+#[derive(Debug, Deserialize)]
+pub struct PostgresActionArgs {
+    #[serde(flatten)]
+    pub conn: PostgresCommandArgs,
+    pub action: String,
+    pub pid: Option<i64>,
+    pub extension_name: Option<String>,
+    pub table_name: Option<String>,
+}
+
+fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
+    let args: PostgresActionArgs = match serde_json::from_value(payload) {
+        Ok(a) => a,
+        Err(e) => return CommandOutcome::failed(format!("Invalid arguments: {e}")),
+    };
+
+    match args.action.as_str() {
+        "cancel_query" => {
+            let pid = match args.pid {
+                Some(p) => p,
+                None => return CommandOutcome::failed("pid is required for cancel_query"),
+            };
+            let sql = format!("SELECT pg_cancel_backend({pid});");
+            match execute_psql(&args.conn, &sql) {
+                Ok(res) => CommandOutcome::ok(
+                    json!({ "success": true, "action": "cancel_query", "pid": pid, "result": res }).to_string(),
+                ),
+                Err(e) => CommandOutcome::failed(format!("Failed to cancel query for PID {pid}: {e}")),
+            }
+        }
+        "terminate_connection" => {
+            let pid = match args.pid {
+                Some(p) => p,
+                None => return CommandOutcome::failed("pid is required for terminate_connection"),
+            };
+            let sql = format!("SELECT pg_terminate_backend({pid});");
+            match execute_psql(&args.conn, &sql) {
+                Ok(res) => CommandOutcome::ok(
+                    json!({ "success": true, "action": "terminate_connection", "pid": pid, "result": res }).to_string(),
+                ),
+                Err(e) => CommandOutcome::failed(format!("Failed to terminate connection for PID {pid}: {e}")),
+            }
+        }
+        "install_extension" => {
+            let ext = match args.extension_name {
+                Some(ref e) if is_safe_identifier(e) => e.as_str(),
+                _ => return CommandOutcome::failed("Valid extension_name is required"),
+            };
+            let sql = format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\";");
+            match execute_psql(&args.conn, &sql) {
+                Ok(_) => CommandOutcome::ok(
+                    json!({ "success": true, "action": "install_extension", "extension": ext }).to_string(),
+                ),
+                Err(e) => CommandOutcome::failed(format!("Failed to install extension {ext}: {e}")),
+            }
+        }
+        "vacuum_table" => {
+            let table = match args.table_name {
+                Some(ref t) if is_safe_identifier(t) => t.as_str(),
+                _ => return CommandOutcome::failed("Valid table_name is required"),
+            };
+            let sql = format!("VACUUM (ANALYZE) {table};");
+            match execute_psql(&args.conn, &sql) {
+                Ok(_) => CommandOutcome::ok(
+                    json!({ "success": true, "action": "vacuum_table", "table": table }).to_string(),
+                ),
+                Err(e) => CommandOutcome::failed(format!("Failed to vacuum table {table}: {e}")),
+            }
+        }
+        "reindex_table" => {
+            let table = match args.table_name {
+                Some(ref t) if is_safe_identifier(t) => t.as_str(),
+                _ => return CommandOutcome::failed("Valid table_name is required"),
+            };
+            let sql = format!("REINDEX TABLE CONCURRENTLY {table};");
+            match execute_psql(&args.conn, &sql) {
+                Ok(_) => CommandOutcome::ok(
+                    json!({ "success": true, "action": "reindex_table", "table": table }).to_string(),
+                ),
+                Err(e) => CommandOutcome::failed(format!("Failed to reindex table {table}: {e}")),
+            }
+        }
+        other => CommandOutcome::failed(format!("Unsupported action: {other}")),
+    }
+}
+
 
