@@ -596,8 +596,8 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
     let db_bytes: i64 = size_parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
     let cache_hit_pct: f64 = size_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(100.0);
 
-    // 4. Slow queries (from pg_stat_statements)
-    let slow_queries_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT query, calls, round(total_exec_time::numeric, 2) as total_exec_time, round(mean_exec_time::numeric, 2) as mean_exec_time, round(min_exec_time::numeric, 2) as min_exec_time, round(max_exec_time::numeric, 2) as max_exec_time, rows FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10) t;";
+    // 4. Slow queries (from pg_stat_statements, excluding backup COPY streams)
+    let slow_queries_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT query, calls, round(total_exec_time::numeric, 2) as total_exec_time, round(mean_exec_time::numeric, 2) as mean_exec_time, round(min_exec_time::numeric, 2) as min_exec_time, round(max_exec_time::numeric, 2) as max_exec_time, rows FROM pg_stat_statements WHERE query NOT ILIKE 'COPY %' ORDER BY total_exec_time DESC LIMIT 10) t;";
     let (has_stat_statements, slow_queries_json) = match execute_psql(&args, slow_queries_sql) {
         Ok(raw) => {
             let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
