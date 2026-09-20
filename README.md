@@ -1,8 +1,14 @@
 # CromoForge
 
-Agente de despliegue de SecuryBlack. Hace `pull` de una imagen OCI y reconcilia el contenedor en ejecución de un servidor contra un estado deseado — con rollback automático si el healthcheck falla. Piensa "Railway, pero el binario vive en tu servidor".
+Agente de despliegue, GitOps y entrega continua de contenedores OCI para servidores Linux y Windows, escrito en Rust. Reconcilia el contenedor en ejecución de un servidor contra un estado deseado — con rollback automático si el healthcheck falla.
 
-> **Estado:** esqueleto. Arranca, carga config, expone logging/status socket/auto-update vía [`sb-agent-core`](https://github.com/SecuryBlack/sb-agent-core) — pero **el reconciliador no existe todavía** (pull de imagen, healthcheck, rollback). Ver [`TODO.md`](TODO.md) para las decisiones cerradas y lo que falta antes de que eso exista.
+[![Website](https://img.shields.io/badge/Website-cromoforge.dev-6366F1?style=flat-square)](https://cromoforge.dev)
+[![Ecosystem](https://img.shields.io/badge/Ecosystem-SecuryBlack-33E1BF?style=flat-square)](https://securyblack.com)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+
+> **Parte del ecosistema SecuryBlack:**
+> [OxiPulse (Métricas)](https://github.com/securyblack/oxi-pulse) · [FerroSentry (Seguridad)](https://github.com/securyblack/ferro-sentry) · [CupraFlow (Alta Disponibilidad)](https://github.com/securyblack/cupra-flow) · **CromoForge (GitOps)** · [TitanVault (Backups)](https://github.com/securyblack/titan-vault) · [SecuryBlack Cloud](https://securyblack.com)
 
 ---
 
@@ -41,6 +47,22 @@ CromoForge es el primer consumidor real del [crate compartido](https://github.co
 4. Modelo de datos en `api-internal` (reutilizar `agents` con `agent_type = "cromoforge"` + tablas de apps/deploys/secretos sellados).
 
 Ver el desglose completo, con las decisiones ya cerradas y las abiertas, en [`TODO.md`](TODO.md).
+
+---
+
+## 🌐 Ecosistema Open Source de SecuryBlack
+
+CromoForge es el pilar de GitOps y despliegues dentro de la suite de agentes modulares de SecuryBlack:
+
+| Agente | Enfoque Principal | Web Oficial | Repositorio |
+| :--- | :--- | :--- | :--- |
+| **OxiPulse** | Telemetría, métricas OTLP y logs sin overhead | [oxipulse.dev](https://oxipulse.dev) | [securyblack/oxi-pulse](https://github.com/securyblack/oxi-pulse) |
+| **FerroSentry** | EDR ligero, auditd, detección de fuerza bruta y firewall | [ferrosentry.dev](https://ferrosentry.dev) | [securyblack/ferro-sentry](https://github.com/securyblack/ferro-sentry) |
+| **CupraFlow** | Alta disponibilidad, IP flotante VIP y balanceo de tráfico | [cupraflow.dev](https://cupraflow.dev) | [securyblack/cupra-flow](https://github.com/securyblack/cupra-flow) |
+| **CromoForge** | Despliegues continuos, GitOps y gestión de contenedores | [cromoforge.dev](https://cromoforge.dev) | [securyblack/cromo-forge](https://github.com/securyblack/cromo-forge) |
+| **TitanVault** | Copias de seguridad en streaming y recuperación ante desastres | [titanvault.dev](https://titanvault.dev) | [securyblack/titan-vault](https://github.com/securyblack/titan-vault) |
+
+Todos los agentes pueden gestionarse de forma centralizada y visual conectándolos a [SecuryBlack Cloud](https://securyblack.com).
 
 ---
 
