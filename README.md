@@ -1,6 +1,14 @@
 # CromoForge
 
-Autonomous GitOps, continuous delivery, and container lifecycle agent for Linux and Windows servers, written in pure Rust. Reconciles running containers against a desired state — with automated instant rollback if health checks fail.
+Rust agent for Docker container lifecycle/logs and PostgreSQL management on Linux and Windows. GitOps reconciliation, sealed secrets and atomic rollout/rollback remain planned. See the [workspace wiki](../sb-wiki/Producto/Estado%20actual.md) for verified capability status.
+
+## Use with SecuryBlack
+
+SecuryBlack is a hosted panel for server metrics, security findings and alerts. This repository contains the native agent; the hosted panel is a separate part of the product.
+
+[Watch the 42-second product demo](https://securyblack.com/en?utm_source=github&utm_medium=referral&utm_campaign=agent_readme&utm_content=cromo-forge#how-it-works) · [Open the hosted panel](https://app.securyblack.com) · [Installation documentation](https://securyblack.com/en/docs/installation)
+
+Follow the agent-specific installation and configuration instructions below. Use the hosted panel to obtain connection settings for your server.
 
 [![Website](https://img.shields.io/badge/Website-cromoforge.dev-6366F1?style=flat-square)](https://cromoforge.dev)
 [![Ecosystem](https://img.shields.io/badge/Ecosystem-SecuryBlack-33E1BF?style=flat-square)](https://securyblack.com)
@@ -8,7 +16,7 @@ Autonomous GitOps, continuous delivery, and container lifecycle agent for Linux 
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 
 > **Part of the SecuryBlack ecosystem:**
-> [OxiPulse (Metrics)](https://github.com/securyblack/oxi-pulse) · [FerroSentry (Security)](https://github.com/securyblack/ferro-sentry) · [CupraFlow (High Availability)](https://github.com/securyblack/cupra-flow) · **CromoForge (GitOps)** · [TitanVault (Backups)](https://github.com/securyblack/titan-vault) · [SecuryBlack Cloud](https://securyblack.com)
+> [OxiPulse (Metrics)](https://github.com/securyblack/oxi-pulse) · [FerroSentry (Security)](https://github.com/securyblack/ferro-sentry) · [CupraFlow (Networking/HA development)](https://github.com/securyblack/cupra-flow) · **CromoForge (Docker/PostgreSQL)** · [TitanVault (Backups)](https://github.com/securyblack/titan-vault) · [SecuryBlack Cloud](https://securyblack.com)
 
 ---
 
@@ -22,7 +30,7 @@ Part of the SecuryBlack native agent family: [OxiPulse](https://github.com/Secur
 
 ---
 
-## 🏗️ Architecture & Design Principles
+## Planned architecture (not implemented yet)
 
 - **Registry-First Delivery:** Production deployments perform `pull` + `up` + health check + rollback. Container images are built in CI pipelines and fetched from registries rather than built on production host servers.
 - **Reconciliation Engine:** State convergence loop (desired state → observed state → convergence) supporting pluggable sources: `securyblack` (via Conduit tunnel), `git` (declarative GitOps), and `local` (`cromoforge.toml`).
@@ -62,11 +70,11 @@ CromoForge is the GitOps and continuous delivery pillar of the SecuryBlack modul
 
 | Agent | Core Focus | Official Website | Repository |
 | :--- | :--- | :--- | :--- |
-| **OxiPulse** | Telemetry, OTLP metrics, and zero-overhead vital signs | [oxipulse.dev](https://oxipulse.dev) | [securyblack/oxi-pulse](https://github.com/securyblack/oxi-pulse) |
+| **OxiPulse** | Server telemetry and OTLP metrics | [oxipulse.dev](https://oxipulse.dev) | [securyblack/oxi-pulse](https://github.com/securyblack/oxi-pulse) |
 | **FerroSentry** | Lightweight EDR, auditd, brute-force mitigation & firewall | [ferrosentry.dev](https://ferrosentry.dev) | [securyblack/ferro-sentry](https://github.com/securyblack/ferro-sentry) |
-| **CupraFlow** | High availability, floating VIP failover & traffic balancing | [cupraflow.dev](https://cupraflow.dev) | [securyblack/cupra-flow](https://github.com/securyblack/cupra-flow) |
-| **CromoForge** | Continuous delivery, GitOps & container management | [cromoforge.dev](https://cromoforge.dev) | [securyblack/cromo-forge](https://github.com/securyblack/cromo-forge) |
-| **TitanVault** | Zero-disk streaming backups & disaster recovery | [titanvault.dev](https://titanvault.dev) | [securyblack/titan-vault](https://github.com/securyblack/titan-vault) |
+| **CupraFlow** | Networking/HA development (not operationally verified) | [cupraflow.dev](https://cupraflow.dev) | [securyblack/cupra-flow](https://github.com/securyblack/cupra-flow) |
+| **CromoForge** | Docker containers, logs & PostgreSQL management | [cromoforge.dev](https://cromoforge.dev) | [securyblack/cromo-forge](https://github.com/securyblack/cromo-forge) |
+| **TitanVault** | Streaming backups (restore workflow not verified) | [titanvault.dev](https://titanvault.dev) | [securyblack/titan-vault](https://github.com/securyblack/titan-vault) |
 
 All agents can be centrally managed with unified observability by connecting them to [SecuryBlack Cloud](https://securyblack.com).
 
@@ -75,3 +83,7 @@ All agents can be centrally managed with unified observability by connecting the
 ## License
 
 CromoForge is licensed under the [Apache License, Version 2.0](LICENSE).
+
+## Maintainer context (workspace)
+
+English is the primary language for this repository's public documentation. Shared product decisions, commercial terms and the backlog live in the [workspace wiki](../sb-wiki/Índice.md), [current state](../sb-wiki/Producto/Estado%20actual.md) and [product log](../sb-wiki/Producto/Bitácora.md). These links require `sb-wiki` as a sibling checkout. Keep agent-specific usage and technical contracts here; update shared decisions in the wiki.
