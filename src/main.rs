@@ -50,6 +50,10 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
     sb_agent_core::command_intake::spawn_server(
         command_registry,
         sb_agent_core::command_intake::default_socket_path(AGENT_NAME),
+        sb_agent_core::command_intake::SigningContext {
+            server_token: cfg.token.clone().unwrap_or_default(),
+            target_agent: AGENT_NAME.to_string(),
+        },
     );
 
     updater::start_daily_check(updater::UpdaterConfig::new(
