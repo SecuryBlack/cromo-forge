@@ -529,6 +529,9 @@ async fn ensure_buildkit(p: &Progress) -> Result<(), String> {
                 "--restart", "unless-stopped",
                 "--cpus", &cpus,
                 "--memory", &format!("{mem_mb}m"),
+                // Volumen con nombre: la caché sobrevive a recrear el contenedor
+                // y no queda un volumen anónimo huérfano llenando el disco.
+                "-v", "sb-buildkit-state:/var/lib/buildkit",
                 BUILDKIT_IMAGE,
             ])
             .await?;
