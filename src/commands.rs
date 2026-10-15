@@ -91,6 +91,12 @@ pub fn register(registry: &CommandRegistry) {
             .await
             .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
     });
+
+    // Despliegues desde git (Fase 1). Asíncronos: sus hijos mueren si la orden caduca.
+    registry.register("deploy_app", crate::deploy::deploy_app);
+    registry.register("remove_app", crate::deploy::remove_app);
+    registry.register("proxy_status", crate::proxy::proxy_status);
+    registry.register("proxy_install", crate::proxy::proxy_install);
 }
 
 

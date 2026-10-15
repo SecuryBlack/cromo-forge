@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Deployments**: `deploy_app` command — fetches a GitHub commit tarball, builds it with Railpack against a resource-capped BuildKit container (`sb-buildkit`), starts it as `sbapp-<app>-<deployment>`, healthchecks it (HTTP for `web`, 30 s stability for `worker`), switches the Caddy route and keeps the newest `keep_images` images. Streams `build_log` lines and stage heartbeats; rollbacks reuse an existing `sbapp/<app>` image. One deployment at a time per app.
+- **Deployments**: `remove_app` command — removes an app's containers, images and Caddy route.
+- **Proxy**: `proxy_status` and `proxy_install` commands — SB-managed Caddy (`sb-caddy`, host network, admin API on `127.0.0.1:2019`) with automatic HTTPS.
+
 ## [0.1.5] - 2026-10-14
 
 ### Security

@@ -9,11 +9,15 @@ repository = "https://github.com/securyblack/cromo-forge"
 
 [dependencies]
 sb-agent-core = { git = "https://github.com/securyblack/sb-agent-core", branch = "master" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "io-util", "fs"] }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Ya en el árbol vía sb-agent-core (self_update): no añaden crates nuevos.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

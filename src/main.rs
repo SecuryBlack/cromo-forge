@@ -11,6 +11,8 @@
 
 mod commands;
 mod config;
+mod deploy;
+mod proxy;
 
 use config::Config;
 use sb_agent_core::{config as core_config, logging, service, status, updater};
