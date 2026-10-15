@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # CromoForge — Install script
 # Usage: curl -fsSL https://install.cromoforge.dev | bash -s -- --token <TOKEN>
+#
+# Prerequisite for git deployments: Docker Engine with the buildx plugin.
+# This script does not install Docker; it only warns if it is missing.
 set -euo pipefail
 
 SB_AGENT_LABEL="cromoforge"
@@ -17,6 +20,9 @@ BINARY_NAME="cromoforge"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/cromoforge"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
+# Railpack builds app images for git deployments. Pinned: bump on purpose.
+RAILPACK_VERSION="v0.40.1"
+RAILPACK_RELEASES="https://github.com/railwayapp/railpack/releases/download/${RAILPACK_VERSION}"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 TOKEN=""
@@ -47,6 +53,33 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 sb_download_and_verify "$DOWNLOAD_URL" "${TMP_DIR}/${ASSET_NAME}"
 sb_install_binary "${TMP_DIR}/${ASSET_NAME}" "$BINARY_NAME" "$INSTALL_DIR"
+
+# ─── Railpack ─────────────────────────────────────────────────────────────────
+case "$TARGET" in
+  x86_64-*)  RAILPACK_ARCH="x86_64" ;;
+  aarch64-*) RAILPACK_ARCH="arm64"  ;;
+esac
+RAILPACK_ASSET="railpack-${RAILPACK_VERSION}-${RAILPACK_ARCH}-unknown-linux-musl.tar.gz"
+RAILPACK_DIR="${TMP_DIR}/railpack"
+mkdir -p "$RAILPACK_DIR"
+
+sb_info "Downloading Railpack ${RAILPACK_VERSION}…"
+curl -fsSL "${RAILPACK_RELEASES}/${RAILPACK_ASSET}" -o "${RAILPACK_DIR}/${RAILPACK_ASSET}" \
+  || sb_die "Railpack download failed (${RAILPACK_ASSET})"
+curl -fsSL "${RAILPACK_RELEASES}/checksums.txt" -o "${RAILPACK_DIR}/checksums.txt" \
+  || sb_die "Railpack checksums.txt not found. Refusing to install an unverified binary."
+# Only our asset's line: without it, sha256sum -c would have nothing to check.
+grep -E "^[0-9a-f]{64}  ${RAILPACK_ASSET}\$" "${RAILPACK_DIR}/checksums.txt" > "${RAILPACK_DIR}/asset.sha256" \
+  || sb_die "No checksum for ${RAILPACK_ASSET} in checksums.txt. Refusing to install."
+(cd "$RAILPACK_DIR" && sha256sum -c asset.sha256 --quiet) || sb_die "Railpack checksum verification failed"
+sb_success "Railpack checksum OK"
+sb_install_binary "${RAILPACK_DIR}/${RAILPACK_ASSET}" "railpack" "$INSTALL_DIR"
+
+if ! command -v docker &>/dev/null; then
+  sb_warn "Docker not found. Git deployments need Docker Engine with the buildx plugin."
+elif ! docker buildx version &>/dev/null; then
+  sb_warn "Docker buildx plugin not found. Git deployments need it."
+fi
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
