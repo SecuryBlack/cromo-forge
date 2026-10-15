@@ -1027,9 +1027,20 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
         if !containers.is_empty() {
             docker(["rm", "-f"].into_iter().map(String::from).chain(containers.iter().cloned())).await?;
         }
-        let images = lines(&docker(["images", &format!("sbapp/{}", req.app_id), "--format", "{{.ID}}"]).await?);
-        if !images.is_empty() {
-            docker(["rmi", "-f"].into_iter().map(String::from).chain(images.iter().cloned())).await?;
+        // Por etiqueta, no por ID: si otra app tiene la misma imagen (mismo
+        // repo y commit), solo se le quitan las etiquetas de esta.
+        let listed = docker(["images", &format!("sbapp/{}", req.app_id), "--format", "{{.ID}} {{.Repository}}:{{.Tag}}"]).await?;
+        let mut refs = Vec::new();
+        for line in lines(&listed) {
+            let Some((id, r)) = line.split_once(' ') else { continue };
+            if r.ends_with(":<none>") {
+                let _ = docker(["rmi", id]).await;
+            } else {
+                refs.push(r.to_string());
+            }
+        }
+        if !refs.is_empty() {
+            docker(["rmi"].into_iter().map(String::from).chain(refs.iter().cloned())).await?;
         }
         if proxy::caddy_state().await == "running" {
             proxy::delete_route(&req.app_id).await?;
@@ -1037,7 +1048,7 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
         Ok::<_, String>(json!({
             "app_id": req.app_id,
             "containers_removed": containers.len(),
-            "images_removed": images.len(),
+            "images_removed": refs.len(),
         }))
     }
     .await;
