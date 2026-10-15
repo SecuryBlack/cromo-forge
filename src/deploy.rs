@@ -2,7 +2,8 @@
 //!
 //! El camino de `deploy_app` es fetch (tarball de GitHub) → build (Railpack
 //! contra el BuildKit `sb-buildkit`) → start → healthcheck → switch (ruta de
-//! Caddy) → cleanup. Formatos, nombres en Docker y etapas de progreso están
+//! Caddy) → cleanup. Las apps `cron` paran tras el build: guardan su horario
+//! en `CRON_DIR` y las lanza `run_due_cron_jobs` cada minuto. Formatos, nombres en Docker y etapas de progreso están
 //! fijados en `sb-wiki/Tecnica/Fase 1 - Contrato de despliegues.md`; si algo
 //! cambia aquí, cambia antes allí.
 //!
@@ -15,7 +16,8 @@
 
 use crate::proxy;
 use sb_agent_core::command_intake::{CommandOutcome, CommandProgress, ProgressSender};
-use serde::Deserialize;
+use crate::cron;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -32,6 +34,7 @@ const PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=29999;
 const MAX_TARBALL_BYTES: u64 = 1024 * 1024 * 1024;
 const LOG_LINE_MAX_CHARS: usize = 2000;
 const HEARTBEAT: Duration = Duration::from_secs(60);
+const CRON_DIR: &str = "/var/lib/cromoforge/cron";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Payload y validación
@@ -42,6 +45,7 @@ const HEARTBEAT: Duration = Duration::from_secs(60);
 enum AppKind {
     Web,
     Worker,
+    Cron,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,9 @@ struct AppSpec {
     domain: Option<String>,
     #[serde(default)]
     start_command: Option<String>,
+    /// Solo en `cron`: 5 campos, UTC.
+    #[serde(default)]
+    schedule: Option<String>,
 }
 
 /// Sin `Debug` a propósito: lleva el token de instalación de GitHub.
@@ -190,6 +197,10 @@ impl DeployRequest {
             if cmd.is_empty() || cmd.len() > 4096 || cmd.contains('\0') {
                 return Err("invalid app.start_command".into());
             }
+        }
+        if app.kind == AppKind::Cron {
+            let schedule = app.schedule.as_deref().ok_or("app.schedule is required for cron apps")?;
+            cron::Schedule::parse(schedule).map_err(|e| format!("invalid app.schedule: {e}"))?;
         }
         match (&self.source, &self.image) {
             (Some(src), None) => {
@@ -696,6 +707,158 @@ async fn cleanup(app_id: &str, new_container: &str, image: &str, keep: usize, p:
     Ok(())
 }
 
+/// Tamaño total en KB de la salida de `df -Pk <dir>`.
+fn parse_df_total_kb(out: &str) -> Option<u64> {
+    out.lines().nth(1)?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `--keep-storage` en MB: 10 % del disco, mínimo 2 GB.
+fn prune_keep_mb(disk_kb: u64) -> u64 {
+    (disk_kb / 1024 / 10).max(2048)
+}
+
+/// Recorta la caché de BuildKit según el disco donde vive el data root de Docker.
+async fn prune_buildkit() -> Result<(), String> {
+    let root = docker(["info", "-f", "{{.DockerRootDir}}"]).await?;
+    let out = Command::new("df")
+        .args(["-Pk", &root])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("failed to execute df: {e}"))?;
+    let disk_kb = parse_df_total_kb(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| format!("could not read disk size of {root}"))?;
+    let keep = prune_keep_mb(disk_kb).to_string();
+    docker(["exec", BUILDKIT_CONTAINER, "buildctl", "prune", "--keep-storage", &keep]).await.map(|_| ())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cron
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `<CRON_DIR>/<app.id>.json`, 0600. Sin `Debug`: `env` son secretos.
+#[derive(Serialize, Deserialize)]
+struct CronJob {
+    image: String,
+    schedule: String,
+    start_command: Option<String>,
+    env: BTreeMap<String, String>,
+}
+
+fn cron_file(dir: &Path, app_id: &str) -> PathBuf {
+    dir.join(format!("{app_id}.json"))
+}
+
+fn cron_container(app_id: &str) -> String {
+    format!("sbapp-{app_id}-run")
+}
+
+/// Escribe en un `.tmp` 0600 y lo renombra encima: el planificador nunca ve
+/// un fichero a medias.
+fn save_cron_job(dir: &Path, app_id: &str, job: &CronJob) -> Result<(), String> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
+    }
+    let path = cron_file(dir, app_id);
+    let tmp = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let content = serde_json::to_string(job).map_err(|e| format!("serialize cron job: {e}"))?;
+    write_private(&tmp, &content)?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn load_cron_job(dir: &Path, app_id: &str) -> Result<Option<CronJob>, String> {
+    let path = cron_file(dir, app_id);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).map(Some).map_err(|e| format!("parse {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Apps de `dir` cuyo horario coincide con `now`.
+fn due_cron_apps(dir: &Path, now: cron::Minute) -> Vec<String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!("read {}: {e}", dir.display());
+            return Vec::new();
+        }
+    };
+    let mut due = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(app_id) = name.strip_suffix(".json").filter(|id| is_uuid(id)) else { continue };
+        let schedule = load_cron_job(dir, app_id)
+            .and_then(|job| job.map(|j| cron::Schedule::parse(&j.schedule)).transpose());
+        match schedule {
+            Ok(Some(s)) if s.matches(now) => due.push(app_id.to_string()),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(app_id, "cron job skipped: {e}"),
+        }
+    }
+    due
+}
+
+/// Lanza en segundo plano los cron que tocan en `now`.
+pub fn run_due_cron_jobs(now: cron::Minute) {
+    for app_id in due_cron_apps(Path::new(CRON_DIR), now) {
+        tokio::spawn(async move {
+            if let Err(e) = run_cron_job(&app_id).await {
+                tracing::warn!(app_id, "cron run failed: {e}");
+            }
+        });
+    }
+}
+
+async fn run_cron_job(app_id: &str) -> Result<(), String> {
+    // ponytail: comparte candado con deploy_app, así que un build largo
+    // retrasa la ejecución hasta que acabe. Separar candados si molesta.
+    let lock = app_lock(app_id);
+    let _guard = lock.lock().await;
+    // Se relee bajo el candado: `remove_app` o un despliegue pueden haberlo cambiado.
+    let Some(job) = load_cron_job(Path::new(CRON_DIR), app_id)? else { return Ok(()) };
+
+    let name = cron_container(app_id);
+    if docker(["inspect", "-f", "{{.State.Running}}", &name]).await.as_deref() == Ok("true") {
+        tracing::warn!(app_id, "previous cron run still running, skipping this one");
+        return Ok(());
+    }
+    let _ = docker(["rm", "-f", &name]).await;
+
+    let env_dir = WorkDir::new("cron", app_id)?;
+    let env_file = env_dir.0.join("app.env");
+    write_private(&env_file, &env_file_content(&job.env, false))?;
+    let env_path = env_file.to_string_lossy().into_owned();
+    let label = format!("sb.app={app_id}");
+    let result = docker([
+        "run", "-d",
+        "--pull", "never",
+        "--name", &name,
+        "--label", &label,
+        "--env-file", &env_path,
+        &job.image,
+    ])
+    .await
+    .map(|_| ());
+    drop(env_dir);
+    if result.is_ok() {
+        tracing::info!(app_id, "cron run started");
+    }
+    result
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Órdenes
 // ─────────────────────────────────────────────────────────────────────────────
@@ -727,6 +890,7 @@ pub async fn deploy_app(payload: Value, tx: ProgressSender) -> CommandOutcome {
     let p = Progress::new(tx);
 
     match run_deploy(&req, &p).await {
+        // `container` y `host_port` son nulos en los cron (no se arranca nada).
         Ok((image, container, host_port)) => CommandOutcome::ok(
             json!({
                 "deployment_id": req.deployment_id,
@@ -745,7 +909,7 @@ pub async fn deploy_app(payload: Value, tx: ProgressSender) -> CommandOutcome {
     }
 }
 
-async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, String, Option<u16>), StageError> {
+async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, Option<String>, Option<u16>), StageError> {
     let app = &req.app;
 
     let image = match (&req.source, &req.image) {
@@ -760,6 +924,10 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, String
             railpack_build(&dir, &image, &req.build_env, app.start_command.as_deref(), p)
                 .await
                 .map_err(at("build"))?;
+            if let Err(e) = prune_buildkit().await {
+                tracing::warn!(app_id = %app.id, "buildkit prune failed: {e}");
+                p.log(&format!("BuildKit cache prune failed: {e}"));
+            }
             image
         }
         (None, Some(image)) => image.clone(),
@@ -770,8 +938,23 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, String
     docker(["image", "inspect", "--format", "{{.Id}}", &image])
         .await
         .map_err(|_| ("start", format!("image {image} not found on this host")))?;
+    if app.kind == AppKind::Cron {
+        let job = CronJob {
+            image: image.clone(),
+            schedule: app.schedule.clone().unwrap_or_default(),
+            start_command: app.start_command.clone(),
+            env: req.env.clone(),
+        };
+        save_cron_job(Path::new(CRON_DIR), &app.id, &job).map_err(at("start"))?;
+        p.stage("cleanup", "Removing old images");
+        // Se salva el contenedor de la última ejecución (puede estar en marcha).
+        if let Err(e) = cleanup(&app.id, &cron_container(&app.id), &image, req.keep_images, p).await {
+            p.log(&format!("cleanup: {e}"));
+        }
+        return Ok((image, None, None));
+    }
     let host_port = match app.kind {
-        AppKind::Worker => None,
+        AppKind::Worker | AppKind::Cron => None,
         AppKind::Web => {
             let published = docker_published_ports().await.map_err(at("start"))?;
             let free = |port: u16| {
@@ -813,7 +996,7 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, String
         p.log(&format!("cleanup: {e}"));
     }
 
-    Ok((image, container, host_port))
+    Ok((image, Some(container), host_port))
 }
 
 #[derive(Deserialize)]
@@ -833,6 +1016,10 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
     let _guard = lock.lock().await;
 
     let result = async {
+        match std::fs::remove_file(cron_file(Path::new(CRON_DIR), &req.app_id)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("remove cron file: {e}")),
+            _ => {}
+        }
         let containers = container_names(&req.app_id).await?;
         if !containers.is_empty() {
             docker(["rm", "-f"].into_iter().map(String::from).chain(containers.iter().cloned())).await?;
@@ -919,7 +1106,8 @@ mod tests {
             ("/app/healthcheck_path", json!("health")),
             ("/app/healthcheck_path", json!("/a b")),
             ("/app/port", json!(0)),
-            ("/app/type", json!("cron")),
+            ("/app/type", json!("cron")), // sin schedule
+            ("/app/type", json!("job")),
             ("/image", json!(format!("sbapp/{APP_ID}:abcdefabcdef"))),
         ];
         for (ptr, bad) in cases {
@@ -1028,6 +1216,71 @@ mod tests {
         let root = dir.0.clone();
         drop(dir);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn cron_apps_need_a_valid_schedule() {
+        let mut v = payload();
+        v["app"]["type"] = json!("cron");
+        v["app"]["domain"] = Value::Null;
+        v["app"]["schedule"] = json!("*/5 * * * *");
+        let r = validate(v.clone()).unwrap();
+        assert_eq!(r.app.kind, AppKind::Cron);
+        for bad in ["* * * *", "61 * * * *", ""] {
+            v["app"]["schedule"] = json!(bad);
+            assert!(validate(v.clone()).is_err(), "{bad:?} should be rejected");
+        }
+        v["app"]["schedule"] = Value::Null;
+        assert!(validate(v).is_err());
+    }
+
+    #[test]
+    fn cron_file_is_private_overwritten_and_found_when_due() {
+        let dir = WorkDir::new("cron-test", "00000000-0000-0000-0000-000000000000").unwrap();
+        let cron_dir = dir.0.join("cron");
+        let mut job = CronJob {
+            image: format!("sbapp/{APP_ID}:aaaaaaaaaaaa"),
+            schedule: "30 2 * * *".into(),
+            start_command: Some("node job.js".into()),
+            env: [("K".to_string(), "V".to_string())].into(),
+        };
+        save_cron_job(&cron_dir, APP_ID, &job).unwrap();
+        job.image = format!("sbapp/{APP_ID}:bbbbbbbbbbbb");
+        save_cron_job(&cron_dir, APP_ID, &job).unwrap();
+
+        let stored: Value = serde_json::from_str(&std::fs::read_to_string(cron_file(&cron_dir, APP_ID)).unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            json!({
+                "image": format!("sbapp/{APP_ID}:bbbbbbbbbbbb"),
+                "schedule": "30 2 * * *",
+                "start_command": "node job.js",
+                "env": { "K": "V" },
+            })
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(cron_file(&cron_dir, APP_ID)).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(&cron_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+
+        // Ficheros ajenos y horarios rotos se ignoran.
+        std::fs::write(cron_dir.join("notes.json"), "{}").unwrap();
+        std::fs::write(cron_dir.join("11111111-1111-1111-1111-111111111111.json"), "{").unwrap();
+        let at = |minute, hour| cron::Minute { minute, hour, dom: 15, month: 10, dow: 4 };
+        assert_eq!(due_cron_apps(&cron_dir, at(30, 2)), vec![APP_ID.to_string()]);
+        assert!(due_cron_apps(&cron_dir, at(31, 2)).is_empty());
+        assert!(due_cron_apps(&dir.0.join("missing"), at(30, 2)).is_empty());
+    }
+
+    #[test]
+    fn buildkit_prune_keeps_10_percent_min_2gb() {
+        let df = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n/dev/sda1        102400000  51200000  51200000      50% /\n";
+        assert_eq!(parse_df_total_kb(df), Some(102_400_000));
+        assert_eq!(parse_df_total_kb("garbage"), None);
+        assert_eq!(prune_keep_mb(102_400_000), 10_000);
+        assert_eq!(prune_keep_mb(10_485_760), 2048, "10 GB disk -> 2 GB floor");
     }
 
     #[tokio::test]

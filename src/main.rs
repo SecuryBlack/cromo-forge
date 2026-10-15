@@ -2,15 +2,12 @@
 //!
 //! Este es el esqueleto que valida `sb-agent-core` desde un agente
 //! greenfield: config, logging, wrapper de servicio, updater y status
-//! socket ya vienen del crate compartido. Lo que falta aquí a propósito es
-//! el reconciliador de verdad (pull de imagen OCI, healthcheck, rollback) —
-//! eso es la siguiente fase, una vez esté cerrado el contrato de estado
-//! deseado (ver TODO.md). Por ahora el loop principal solo demuestra que el
-//! ciclo de vida completo (arranca, carga config, expone status, apaga
-//! limpio) funciona de punta a punta.
+//! socket ya vienen del crate compartido. Los despliegues llegan como
+//! órdenes (`deploy.rs`); el loop principal solo lanza las apps cron.
 
 mod commands;
 mod config;
+mod cron;
 mod deploy;
 mod proxy;
 
@@ -63,19 +60,20 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
 
     status_handle.set_state("running");
     status_handle.set_details(serde_json::json!({
-        "reconciler": "not implemented yet",
+        "cron_scheduler": "running",
         "source": cfg.source,
     }));
 
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(cfg.poll_interval_secs));
+    // Planificador de apps cron: despierta al empezar cada minuto (UTC).
     loop {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // +200 ms para no caer en el 59,999 del minuto anterior.
+        let wait = std::time::Duration::from_millis(60_000 - now_ms % 60_000 + 200);
         tokio::select! {
-            _ = interval.tick() => {
-                // Placeholder: aquí va el reconciliador (leer estado deseado,
-                // comparar con el observado, converger). Todavía no existe.
-                tracing::debug!("tick — reconciler not implemented yet");
-            }
+            _ = tokio::time::sleep(wait) => deploy::run_due_cron_jobs(cron::Minute::now()),
             _ = &mut shutdown => {
                 info!("shutdown signal received, stopping");
                 status_handle.set_state("stopping");
