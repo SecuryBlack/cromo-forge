@@ -221,6 +221,10 @@ impl DeployRequest {
                 return Err(format!("invalid env value for {k}"));
             }
         }
+        // `--env-file` es una línea por variable, sin escapes posibles.
+        if let Some((k, _)) = self.env.iter().find(|(_, v)| v.contains(['\n', '\r'])) {
+            return Err(format!("env value for {k} contains a newline"));
+        }
         self.keep_images = self.keep_images.clamp(1, 50);
         Ok(())
     }
@@ -414,11 +418,16 @@ fn images_to_remove(mut images: Vec<(String, String)>, keep: usize, current: &st
 struct WorkDir(PathBuf);
 
 impl WorkDir {
-    fn new(deployment_id: &str) -> Result<Self, String> {
+    /// `/var/tmp/cromoforge-<kind>-<deployment_id>`, modo 0700.
+    fn new(kind: &str, deployment_id: &str) -> Result<Self, String> {
         let base = if cfg!(unix) { PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
-        let dir = base.join(format!("cromoforge-build-{deployment_id}"));
+        let dir = base.join(format!("cromoforge-{kind}-{deployment_id}"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         Ok(Self(dir))
     }
 }
@@ -563,16 +572,14 @@ async fn start_container(req: &DeployRequest, image: &str, container: &str, host
         "--label".into(), format!("sb.app={}", app.id),
         "--label".into(), format!("sb.deployment={}", req.deployment_id),
     ];
-    // ponytail: `-e K=V` deja los valores un instante en /proc/<pid>/cmdline
-    // de `docker run`; pasarlos por el entorno del hijo permitiría a una app
-    // inyectar LD_PRELOAD/DOCKER_HOST en el CLI de Docker, que es peor.
-    for (k, v) in &req.env {
-        if host_port.is_some() && k == "PORT" {
-            continue;
-        }
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
-    }
+    // `env` va por un fichero 0600 que se borra al volver `docker run`: ni en
+    // la lista de procesos (argv) ni en el entorno del propio CLI de Docker
+    // (donde una app podría colar LD_PRELOAD o DOCKER_HOST).
+    let env_dir = WorkDir::new("env", &req.deployment_id)?;
+    let env_file = env_dir.0.join("app.env");
+    write_private(&env_file, &env_file_content(&req.env, host_port.is_some()))?;
+    args.push("--env-file".into());
+    args.push(env_file.to_string_lossy().into_owned());
     if let Some(hp) = host_port {
         args.push("-p".into());
         args.push(format!("127.0.0.1:{hp}:{}", app.port));
@@ -580,7 +587,30 @@ async fn start_container(req: &DeployRequest, image: &str, container: &str, host
         args.push(format!("PORT={}", app.port));
     }
     args.push(image.into());
-    docker(args).await.map(|_| ())
+    let result = docker(args).await.map(|_| ());
+    drop(env_dir);
+    result
+}
+
+/// Contenido de `--env-file`: `K=V` por línea, literal (Docker no interpreta
+/// comillas ni escapes). Los saltos de línea ya se rechazan al validar. En
+/// las web `PORT` lo fija el contrato y va aparte.
+fn env_file_content(env: &BTreeMap<String, String>, skip_port: bool) -> String {
+    env.iter()
+        .filter(|(k, _)| !(skip_port && k.as_str() == "PORT"))
+        .map(|(k, v)| format!("{k}={v}\n"))
+        .collect()
+}
+
+fn write_private(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
+        .and_then(|mut f| f.write_all(content.as_bytes()))
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 async fn healthcheck(req: &DeployRequest, container: &str, host_port: Option<u16>) -> Result<(), String> {
@@ -721,7 +751,7 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, String
     let image = match (&req.source, &req.image) {
         (Some(src), _) => {
             p.stage("fetch", "Downloading source code");
-            let work = WorkDir::new(&req.deployment_id).map_err(at("fetch"))?;
+            let work = WorkDir::new("build", &req.deployment_id).map_err(at("fetch"))?;
             let dir = fetch_source(src, &work.0).await.map_err(at("fetch"))?;
 
             p.stage("build", "Building image");
@@ -957,6 +987,47 @@ mod tests {
         // Vuelta atrás a una imagen vieja: no se borra aunque quede fuera de las `keep`.
         assert_eq!(images_to_remove(imgs.clone(), 1, "sbapp/x:aaaaaaaaaaaa"), vec!["sbapp/x:cccccccccccc", "sbapp/x:bbbbbbbbbbbb"]);
         assert!(images_to_remove(imgs, 5, "sbapp/x:aaaaaaaaaaaa").is_empty());
+    }
+
+    #[test]
+    fn env_file_is_literal_and_rejects_newlines() {
+        let env: BTreeMap<String, String> = [
+            ("A", r#"x=y "quoted" $HOME 'z' \n"#),
+            ("EMPTY", ""),
+            ("PORT", "9999"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(env_file_content(&env, true), "A=x=y \"quoted\" $HOME 'z' \\n\nEMPTY=\n");
+        assert_eq!(env_file_content(&env, false), "A=x=y \"quoted\" $HOME 'z' \\n\nEMPTY=\nPORT=9999\n");
+
+        for bad in ["a\nB=evil", "a\r"] {
+            let mut v = payload();
+            v["env"] = json!({ "K": bad });
+            assert!(validate(v).is_err(), "{bad:?} should be rejected");
+        }
+        // En `build_env` (argumentos de railpack) un salto de línea no rompe nada.
+        let mut v = payload();
+        v["build_env"] = json!({ "K": "a\nb" });
+        assert!(validate(v).is_ok());
+    }
+
+    #[test]
+    fn env_file_is_private_and_removed() {
+        let dir = WorkDir::new("env-test", "00000000-0000-0000-0000-000000000000").unwrap();
+        let path = dir.0.join("app.env");
+        write_private(&path, "K=V\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "K=V\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let root = dir.0.clone();
+        drop(dir);
+        assert!(!root.exists());
     }
 
     #[tokio::test]
