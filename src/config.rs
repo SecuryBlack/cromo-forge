@@ -1,13 +1,10 @@
-//! Config propia de CromoForge — deliberadamente mínima todavía. El
-//! reconciliador real (pull de imagen OCI, healthcheck, rollback) no está
-//! implementado; este `struct` solo sostiene lo necesario para que el
-//! esqueleto arranque, se loguee y exponga su status socket. Ver
-//! `TODO.md` para el contrato de estado deseado, que es lo próximo por
-//! diseñar antes de que `source` deje de ser un placeholder.
+//! Config propia de CromoForge — deliberadamente mínima. Los despliegues
+//! llegan como órdenes (`deploy.rs`), así que aquí solo vive lo necesario
+//! para arrancar, firmar órdenes con el token y exponer el status socket.
 
 use serde::Deserialize;
 
-#[allow(dead_code)] // usados por el reconciliador real, todavía sin implementar
+#[allow(dead_code)] // `api_url` y `version` no se leen todavía
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]

@@ -50,7 +50,7 @@ CromoForge receives commands from the SecuryBlack panel through the companion ag
 
 ### Linux — One-line Install
 ```bash
-curl -fsSL https://install.cromoforge.dev | sudo bash
+curl -fsSL https://install.cromoforge.dev | sudo bash -s -- --token <TOKEN>
 ```
 
 Git deployments require Docker Engine with the buildx plugin; the installer does not install Docker. It does install a pinned, checksum-verified [Railpack](https://github.com/railwayapp/railpack) binary to `/usr/local/bin/railpack`.
@@ -60,10 +60,7 @@ Git deployments require Docker Engine with the buildx plugin; the installer does
 irm https://install.cromoforge.dev | iex
 ```
 
-### Interactive Cockpit (TUI)
-```bash
-cromoforge tui
-```
+Without `--token` / `-Token`, the installers ask for the token interactively. The SecuryBlack panel shows the install command with your server token.
 
 ---
 
