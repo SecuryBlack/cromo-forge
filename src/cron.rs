@@ -99,7 +99,11 @@ impl Schedule {
         let bit = |mask: u64, v: u32| mask & (1 << v) != 0;
         let dom = bit(self.dom, t.dom);
         let dow = bit(self.dow, t.dow);
-        let day = if self.dom_star || self.dow_star { dom && dow } else { dom || dow };
+        let day = if self.dom_star || self.dow_star {
+            dom && dow
+        } else {
+            dom || dow
+        };
         bit(self.minute, t.minute) && bit(self.hour, t.hour) && bit(self.month, t.month) && day
     }
 }
@@ -127,7 +131,12 @@ impl Minute {
     }
 
     pub fn now() -> Self {
-        Self::from_unix(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+        Self::from_unix(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
     }
 }
 
@@ -136,7 +145,13 @@ mod tests {
     use super::*;
 
     fn at(minute: u32, hour: u32, dom: u32, month: u32, dow: u32) -> Minute {
-        Minute { minute, hour, dom, month, dow }
+        Minute {
+            minute,
+            hour,
+            dom,
+            month,
+            dow,
+        }
     }
 
     fn values(field: &str, min: u32, max: u32) -> Vec<u32> {
@@ -160,10 +175,27 @@ mod tests {
     #[test]
     fn rejects_bad_expressions() {
         for bad in [
-            "", "* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *",
-            "* * 32 * *", "* * * 0 *", "* * * 13 *", "* * * * 8", "*/0 * * * *",
-            "5-1 * * * *", "a * * * *", "1,,2 * * * *", "-1 * * * *", "1- * * * *",
-            "*/ * * * *", "@daily", "* * * JAN *", "* * * * MON", "1/2/3 * * * *",
+            "",
+            "* * * *",
+            "* * * * * *",
+            "60 * * * *",
+            "* 24 * * *",
+            "* * 0 * *",
+            "* * 32 * *",
+            "* * * 0 *",
+            "* * * 13 *",
+            "* * * * 8",
+            "*/0 * * * *",
+            "5-1 * * * *",
+            "a * * * *",
+            "1,,2 * * * *",
+            "-1 * * * *",
+            "1- * * * *",
+            "*/ * * * *",
+            "@daily",
+            "* * * JAN *",
+            "* * * * MON",
+            "1/2/3 * * * *",
         ] {
             assert!(Schedule::parse(bad).is_err(), "{bad:?} should be rejected");
         }

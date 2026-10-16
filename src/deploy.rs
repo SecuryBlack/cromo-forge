@@ -14,9 +14,9 @@
 //! - Los hijos largos se lanzan con `kill_on_drop`: si la orden caduca, el
 //!   core suelta el future y el build/`docker` muere con él.
 
+use crate::cron;
 use crate::proxy;
 use sb_agent_core::command_intake::{CommandOutcome, CommandProgress, ProgressSender};
-use crate::cron;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -117,26 +117,32 @@ fn is_uuid(s: &str) -> bool {
 }
 
 fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    s.len() == len
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,39}$`
 fn is_app_name(s: &str) -> bool {
     (1..=40).contains(&s.len())
-        && s.chars().enumerate().all(|(i, c)| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || (i > 0 && c == '-')
-        })
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || (i > 0 && c == '-'))
 }
 
 /// `owner/name` con el juego de caracteres de GitHub.
 fn is_repo(s: &str) -> bool {
-    let Some((owner, name)) = s.split_once('/') else { return false };
+    let Some((owner, name)) = s.split_once('/') else {
+        return false;
+    };
     (1..=39).contains(&owner.len())
         && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && (1..=100).contains(&name.len())
         && name != "."
         && name != ".."
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 fn is_domain(s: &str) -> bool {
@@ -146,7 +152,9 @@ fn is_domain(s: &str) -> bool {
             (1..=63).contains(&label.len())
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         })
 }
 
@@ -165,7 +173,9 @@ fn is_healthcheck_path(s: &str) -> bool {
 /// Tokens de instalación (`ghs_...`): van en una cabecera, así que nada de
 /// espacios ni saltos de línea.
 fn is_token(s: &str) -> bool {
-    (1..=512).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    (1..=512).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 impl DeployRequest {
@@ -199,7 +209,10 @@ impl DeployRequest {
             }
         }
         if app.kind == AppKind::Cron {
-            let schedule = app.schedule.as_deref().ok_or("app.schedule is required for cron apps")?;
+            let schedule = app
+                .schedule
+                .as_deref()
+                .ok_or("app.schedule is required for cron apps")?;
             cron::Schedule::parse(schedule).map_err(|e| format!("invalid app.schedule: {e}"))?;
         }
         match (&self.source, &self.image) {
@@ -258,7 +271,10 @@ struct Progress {
 
 impl Progress {
     fn new(tx: ProgressSender) -> Self {
-        Self { tx, heartbeat: Mutex::new(None) }
+        Self {
+            tx,
+            heartbeat: Mutex::new(None),
+        }
     }
 
     fn send(tx: &ProgressSender, stage: &str, message: &str) {
@@ -317,13 +333,21 @@ where
         .map_err(|e| format!("failed to execute docker: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() { format!("docker exited with {}", out.status) } else { err });
+        return Err(if err.is_empty() {
+            format!("docker exited with {}", out.status)
+        } else {
+            err
+        });
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn lines(s: &str) -> Vec<String> {
-    s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Cliente para 127.0.0.1 (healthcheck y API de Caddy): sin proxy del
@@ -364,7 +388,10 @@ async fn pump<R: AsyncRead + Unpin>(stream: R, p: &Progress) -> VecDeque<String>
 
 /// Corre `cmd` volcando stdout y stderr como `build_log`.
 async fn run_streamed(mut cmd: Command, program: &str, p: &Progress) -> Result<(), String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!("{program} is not installed on this host"),
         _ => format!("failed to execute {program}: {e}"),
@@ -376,8 +403,15 @@ async fn run_streamed(mut cmd: Command, program: &str, p: &Progress) -> Result<(
     if status.success() {
         return Ok(());
     }
-    let tail = if err_tail.is_empty() { out_tail } else { err_tail };
-    Err(format!("{program} exited with {status}:\n{}", Vec::from(tail).join("\n")))
+    let tail = if err_tail.is_empty() {
+        out_tail
+    } else {
+        err_tail
+    };
+    Err(format!(
+        "{program} exited with {status}:\n{}",
+        Vec::from(tail).join("\n")
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -404,7 +438,10 @@ fn parse_docker_ports(ports: &str) -> Vec<u16> {
 /// nunca por debajo de 1 GB. Devuelve (`--cpus`, MB de `--memory`).
 fn buildkit_limits(cpus: usize, host_mem_mb: Option<u64>) -> (String, u64) {
     let cpus = (cpus.max(1) as f64) / 2.0;
-    let mem = host_mem_mb.map(|m| (m / 2).min(4096)).unwrap_or(1024).max(1024);
+    let mem = host_mem_mb
+        .map(|m| (m / 2).min(4096))
+        .unwrap_or(1024)
+        .max(1024);
     (format!("{cpus}"), mem)
 }
 
@@ -431,14 +468,20 @@ struct WorkDir(PathBuf);
 impl WorkDir {
     /// `/var/tmp/cromoforge-<kind>-<deployment_id>`, modo 0700.
     fn new(kind: &str, deployment_id: &str) -> Result<Self, String> {
-        let base = if cfg!(unix) { PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
+        let base = if cfg!(unix) {
+            PathBuf::from("/var/tmp")
+        } else {
+            std::env::temp_dir()
+        };
         let dir = base.join(format!("cromoforge-{kind}-{deployment_id}"));
         let _ = std::fs::remove_dir_all(&dir);
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        builder
+            .create(&dir)
+            .map_err(|e| format!("create {}: {e}", dir.display()))?;
         Ok(Self(dir))
     }
 }
@@ -452,7 +495,10 @@ impl Drop for WorkDir {
 /// Descarga el tarball del commit y lo extrae. Devuelve el directorio raíz
 /// del repo (GitHub mete todo en `owner-repo-sha/`).
 async fn fetch_source(src: &Source, work: &Path) -> Result<PathBuf, String> {
-    let url = format!("https://api.github.com/repos/{}/tarball/{}", src.repo, src.sha);
+    let url = format!(
+        "https://api.github.com/repos/{}/tarball/{}",
+        src.repo, src.sha
+    );
     let client = reqwest::Client::builder()
         .user_agent(concat!("cromoforge/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
@@ -469,20 +515,35 @@ async fn fetch_source(src: &Source, work: &Path) -> Result<PathBuf, String> {
         .await
         .map_err(|e| format!("GitHub download failed: {}", e.without_url()))?;
     if !resp.status().is_success() {
-        return Err(format!("GitHub returned {} for {}@{}", resp.status(), src.repo, src.sha));
+        return Err(format!(
+            "GitHub returned {} for {}@{}",
+            resp.status(),
+            src.repo,
+            src.sha
+        ));
     }
 
     let tarball = work.join("source.tar.gz");
-    let mut file = tokio::fs::File::create(&tarball).await.map_err(|e| format!("write tarball: {e}"))?;
+    let mut file = tokio::fs::File::create(&tarball)
+        .await
+        .map_err(|e| format!("write tarball: {e}"))?;
     let mut total = 0u64;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("GitHub download failed: {}", e.without_url()))? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("GitHub download failed: {}", e.without_url()))?
+    {
         total += chunk.len() as u64;
         if total > MAX_TARBALL_BYTES {
             return Err("source tarball exceeds 1 GB".into());
         }
-        file.write_all(&chunk).await.map_err(|e| format!("write tarball: {e}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write tarball: {e}"))?;
     }
-    file.flush().await.map_err(|e| format!("write tarball: {e}"))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("write tarball: {e}"))?;
     drop(file);
 
     let dest = work.join("src");
@@ -507,7 +568,11 @@ async fn fetch_source(src: &Source, work: &Path) -> Result<PathBuf, String> {
 
 fn host_mem_mb() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?;
+    let kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?;
     kb.parse::<u64>().ok().map(|kb| kb / 1024)
 }
 
@@ -519,19 +584,29 @@ async fn ensure_buildkit(p: &Progress) -> Result<(), String> {
             docker(["start", BUILDKIT_CONTAINER]).await?;
         }
         Err(_) => {
-            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
             let (cpus, mem_mb) = buildkit_limits(cpus, host_mem_mb());
-            p.log(&format!("Creating {BUILDKIT_CONTAINER} (cpus {cpus}, memory {mem_mb} MB)"));
+            p.log(&format!(
+                "Creating {BUILDKIT_CONTAINER} (cpus {cpus}, memory {mem_mb} MB)"
+            ));
             docker([
-                "run", "-d",
-                "--name", BUILDKIT_CONTAINER,
+                "run",
+                "-d",
+                "--name",
+                BUILDKIT_CONTAINER,
                 "--privileged",
-                "--restart", "unless-stopped",
-                "--cpus", &cpus,
-                "--memory", &format!("{mem_mb}m"),
+                "--restart",
+                "unless-stopped",
+                "--cpus",
+                &cpus,
+                "--memory",
+                &format!("{mem_mb}m"),
                 // Volumen con nombre: la caché sobrevive a recrear el contenedor
                 // y no queda un volumen anónimo huérfano llenando el disco.
-                "-v", "sb-buildkit-state:/var/lib/buildkit",
+                "-v",
+                "sb-buildkit-state:/var/lib/buildkit",
                 BUILDKIT_IMAGE,
             ])
             .await?;
@@ -559,14 +634,19 @@ async fn railpack_build(
     p: &Progress,
 ) -> Result<(), String> {
     let mut cmd = Command::new("railpack");
-    cmd.arg("build").arg(dir).args(["--name", image, "--progress", "plain"]);
+    cmd.arg("build")
+        .arg(dir)
+        .args(["--name", image, "--progress", "plain"]);
     for (k, v) in build_env {
         cmd.arg("--env").arg(format!("{k}={v}"));
     }
     if let Some(start) = start_command {
         cmd.args(["--start-cmd", start]);
     }
-    cmd.env("BUILDKIT_HOST", format!("docker-container://{BUILDKIT_CONTAINER}"));
+    cmd.env(
+        "BUILDKIT_HOST",
+        format!("docker-container://{BUILDKIT_CONTAINER}"),
+    );
     run_streamed(cmd, "railpack", p).await
 }
 
@@ -576,15 +656,26 @@ async fn docker_published_ports() -> Result<Vec<u16>, String> {
     Ok(out.lines().flat_map(parse_docker_ports).collect())
 }
 
-async fn start_container(req: &DeployRequest, image: &str, container: &str, host_port: Option<u16>) -> Result<(), String> {
+async fn start_container(
+    req: &DeployRequest,
+    image: &str,
+    container: &str,
+    host_port: Option<u16>,
+) -> Result<(), String> {
     let app = &req.app;
     let mut args: Vec<String> = vec![
-        "run".into(), "-d".into(),
-        "--pull".into(), "never".into(),
-        "--name".into(), container.into(),
-        "--restart".into(), "unless-stopped".into(),
-        "--label".into(), format!("sb.app={}", app.id),
-        "--label".into(), format!("sb.deployment={}", req.deployment_id),
+        "run".into(),
+        "-d".into(),
+        "--pull".into(),
+        "never".into(),
+        "--name".into(),
+        container.into(),
+        "--restart".into(),
+        "unless-stopped".into(),
+        "--label".into(),
+        format!("sb.app={}", app.id),
+        "--label".into(),
+        format!("sb.deployment={}", req.deployment_id),
     ];
     // `env` va por un fichero 0600 que se borra al volver `docker run`: ni en
     // la lista de procesos (argv) ni en el entorno del propio CLI de Docker
@@ -627,15 +718,27 @@ fn write_private(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-async fn healthcheck(req: &DeployRequest, container: &str, host_port: Option<u16>) -> Result<(), String> {
+async fn healthcheck(
+    req: &DeployRequest,
+    container: &str,
+    host_port: Option<u16>,
+) -> Result<(), String> {
     let Some(hp) = host_port else {
         // Worker: vivo 30 s después y sin reinicios.
         tokio::time::sleep(Duration::from_secs(30)).await;
-        let state = docker(["inspect", "-f", "{{.State.Running}} {{.RestartCount}}", container]).await?;
+        let state = docker([
+            "inspect",
+            "-f",
+            "{{.State.Running}} {{.RestartCount}}",
+            container,
+        ])
+        .await?;
         return if state == "true 0" {
             Ok(())
         } else {
-            Err(format!("container not stable after 30 s (running/restarts: {state})"))
+            Err(format!(
+                "container not stable after 30 s (running/restarts: {state})"
+            ))
         };
     };
 
@@ -650,7 +753,10 @@ async fn healthcheck(req: &DeployRequest, container: &str, host_port: Option<u16
             Err(e) => e.without_url().to_string(),
         };
         if Instant::now() >= deadline {
-            return Err(format!("healthcheck GET {} failed after {timeout} s: {last}", req.app.healthcheck_path));
+            return Err(format!(
+                "healthcheck GET {} failed after {timeout} s: {last}",
+                req.app.healthcheck_path
+            ));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -665,31 +771,68 @@ async fn dump_container_logs(container: &str, p: &Progress) {
         .output()
         .await
     {
-        for line in String::from_utf8_lossy(&out.stdout).lines().chain(String::from_utf8_lossy(&out.stderr).lines()) {
+        for line in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .chain(String::from_utf8_lossy(&out.stderr).lines())
+        {
             p.log(line);
         }
     }
 }
 
 async fn container_names(app_id: &str) -> Result<Vec<String>, String> {
-    Ok(lines(&docker(["ps", "-a", "--filter", &format!("label=sb.app={app_id}"), "--format", "{{.Names}}"]).await?))
+    Ok(lines(
+        &docker([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=sb.app={app_id}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .await?,
+    ))
 }
 
 /// Para y borra los contenedores viejos de la app y deja las `keep`
 /// imágenes más recientes. Los fallos aquí no tumban el despliegue (la
 /// versión nueva ya está sirviendo), solo se registran.
-async fn cleanup(app_id: &str, new_container: &str, image: &str, keep: usize, p: &Progress) -> Result<(), String> {
-    let old: Vec<String> = container_names(app_id).await?.into_iter().filter(|c| c != new_container).collect();
+async fn cleanup(
+    app_id: &str,
+    new_container: &str,
+    image: &str,
+    keep: usize,
+    p: &Progress,
+) -> Result<(), String> {
+    let old: Vec<String> = container_names(app_id)
+        .await?
+        .into_iter()
+        .filter(|c| c != new_container)
+        .collect();
     if !old.is_empty() {
-        let _ = docker(["stop", "-t", "10"].into_iter().map(String::from).chain(old.iter().cloned())).await;
+        let _ = docker(
+            ["stop", "-t", "10"]
+                .into_iter()
+                .map(String::from)
+                .chain(old.iter().cloned()),
+        )
+        .await;
         docker(["rm", "-f"].into_iter().map(String::from).chain(old)).await?;
     }
 
     let repo = format!("sbapp/{app_id}");
-    let listed = docker(["images", &repo, "--format", "{{.ID}} {{.Repository}}:{{.Tag}}"]).await?;
+    let listed = docker([
+        "images",
+        &repo,
+        "--format",
+        "{{.ID}} {{.Repository}}:{{.Tag}}",
+    ])
+    .await?;
     let mut refs = Vec::new();
     for line in lines(&listed) {
-        let Some((id, r)) = line.split_once(' ') else { continue };
+        let Some((id, r)) = line.split_once(' ') else {
+            continue;
+        };
         if r.ends_with(":<none>") {
             // Restos de reconstruir el mismo sha: ya no los referencia nadie.
             let _ = docker(["rmi", id]).await;
@@ -700,7 +843,13 @@ async fn cleanup(app_id: &str, new_container: &str, image: &str, keep: usize, p:
     if refs.len() <= keep {
         return Ok(());
     }
-    let created = docker(["image", "inspect", "--format", "{{.Created}}"].into_iter().map(String::from).chain(refs.iter().cloned())).await?;
+    let created = docker(
+        ["image", "inspect", "--format", "{{.Created}}"]
+            .into_iter()
+            .map(String::from)
+            .chain(refs.iter().cloned()),
+    )
+    .await?;
     let images: Vec<(String, String)> = lines(&created).into_iter().zip(refs).collect();
     for r in images_to_remove(images, keep, image) {
         if let Err(e) = docker(["rmi", &r]).await {
@@ -733,7 +882,16 @@ async fn prune_buildkit() -> Result<(), String> {
     let disk_kb = parse_df_total_kb(&String::from_utf8_lossy(&out.stdout))
         .ok_or_else(|| format!("could not read disk size of {root}"))?;
     let keep = prune_keep_mb(disk_kb).to_string();
-    docker(["exec", BUILDKIT_CONTAINER, "buildctl", "prune", "--keep-storage", &keep]).await.map(|_| ())
+    docker([
+        "exec",
+        BUILDKIT_CONTAINER,
+        "buildctl",
+        "prune",
+        "--keep-storage",
+        &keep,
+    ])
+    .await
+    .map(|_| ())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -765,7 +923,9 @@ fn save_cron_job(dir: &Path, app_id: &str, job: &CronJob) -> Result<(), String> 
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    builder
+        .create(dir)
+        .map_err(|e| format!("create {}: {e}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -783,7 +943,9 @@ fn save_cron_job(dir: &Path, app_id: &str, job: &CronJob) -> Result<(), String> 
 fn load_cron_job(dir: &Path, app_id: &str) -> Result<Option<CronJob>, String> {
     let path = cron_file(dir, app_id);
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).map(Some).map_err(|e| format!("parse {}: {e}", path.display())),
+        Ok(s) => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(|e| format!("parse {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read {}: {e}", path.display())),
     }
@@ -802,7 +964,9 @@ fn due_cron_apps(dir: &Path, now: cron::Minute) -> Vec<String> {
     let mut due = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(app_id) = name.strip_suffix(".json").filter(|id| is_uuid(id)) else { continue };
+        let Some(app_id) = name.strip_suffix(".json").filter(|id| is_uuid(id)) else {
+            continue;
+        };
         let schedule = load_cron_job(dir, app_id)
             .and_then(|job| job.map(|j| cron::Schedule::parse(&j.schedule)).transpose());
         match schedule {
@@ -831,10 +995,16 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
     let lock = app_lock(app_id);
     let _guard = lock.lock().await;
     // Se relee bajo el candado: `remove_app` o un despliegue pueden haberlo cambiado.
-    let Some(job) = load_cron_job(Path::new(CRON_DIR), app_id)? else { return Ok(()) };
+    let Some(job) = load_cron_job(Path::new(CRON_DIR), app_id)? else {
+        return Ok(());
+    };
 
     let name = cron_container(app_id);
-    if docker(["inspect", "-f", "{{.State.Running}}", &name]).await.as_deref() == Ok("true") {
+    if docker(["inspect", "-f", "{{.State.Running}}", &name])
+        .await
+        .as_deref()
+        == Ok("true")
+    {
         tracing::warn!(app_id, "previous cron run still running, skipping this one");
         return Ok(());
     }
@@ -846,11 +1016,16 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
     let env_path = env_file.to_string_lossy().into_owned();
     let label = format!("sb.app={app_id}");
     let result = docker([
-        "run", "-d",
-        "--pull", "never",
-        "--name", &name,
-        "--label", &label,
-        "--env-file", &env_path,
+        "run",
+        "-d",
+        "--pull",
+        "never",
+        "--name",
+        &name,
+        "--label",
+        &label,
+        "--env-file",
+        &env_path,
         &job.image,
     ])
     .await
@@ -870,7 +1045,13 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
 fn app_lock(app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     // ponytail: el mapa no se poda nunca; una entrada por app, crece con las apps del servidor.
-    LOCKS.get_or_init(Default::default).lock().unwrap().entry(app_id.to_string()).or_default().clone()
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(app_id.to_string())
+        .or_default()
+        .clone()
 }
 
 type StageError = (&'static str, String);
@@ -905,14 +1086,18 @@ pub async fn deploy_app(payload: Value, tx: ProgressSender) -> CommandOutcome {
         ),
         Err((stage, err)) => CommandOutcome {
             success: false,
-            stdout: json!({ "deployment_id": req.deployment_id, "failed_stage": stage }).to_string(),
+            stdout: json!({ "deployment_id": req.deployment_id, "failed_stage": stage })
+                .to_string(),
             stderr: err,
             exit_code: 1,
         },
     }
 }
 
-async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, Option<String>, Option<u16>), StageError> {
+async fn run_deploy(
+    req: &DeployRequest,
+    p: &Progress,
+) -> Result<(String, Option<String>, Option<u16>), StageError> {
     let app = &req.app;
 
     let image = match (&req.source, &req.image) {
@@ -924,9 +1109,15 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, Option
             p.stage("build", "Building image");
             ensure_buildkit(p).await.map_err(at("build"))?;
             let image = format!("sbapp/{}:{}", app.id, &src.sha[..12]);
-            railpack_build(&dir, &image, &req.build_env, app.start_command.as_deref(), p)
-                .await
-                .map_err(at("build"))?;
+            railpack_build(
+                &dir,
+                &image,
+                &req.build_env,
+                app.start_command.as_deref(),
+                p,
+            )
+            .await
+            .map_err(at("build"))?;
             if let Err(e) = prune_buildkit().await {
                 tracing::warn!(app_id = %app.id, "buildkit prune failed: {e}");
                 p.log(&format!("BuildKit cache prune failed: {e}"));
@@ -951,7 +1142,15 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, Option
         save_cron_job(Path::new(CRON_DIR), &app.id, &job).map_err(at("start"))?;
         p.stage("cleanup", "Removing old images");
         // Se salva el contenedor de la última ejecución (puede estar en marcha).
-        if let Err(e) = cleanup(&app.id, &cron_container(&app.id), &image, req.keep_images, p).await {
+        if let Err(e) = cleanup(
+            &app.id,
+            &cron_container(&app.id),
+            &image,
+            req.keep_images,
+            p,
+        )
+        .await
+        {
             p.log(&format!("cleanup: {e}"));
         }
         return Ok((image, None, None));
@@ -961,9 +1160,13 @@ async fn run_deploy(req: &DeployRequest, p: &Progress) -> Result<(String, Option
         AppKind::Web => {
             let published = docker_published_ports().await.map_err(at("start"))?;
             let free = |port: u16| {
-                !published.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                !published.contains(&port)
+                    && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
             };
-            Some(pick_port(free).ok_or_else(|| ("start", "no free port in 20000-29999".to_string()))?)
+            Some(
+                pick_port(free)
+                    .ok_or_else(|| ("start", "no free port in 20000-29999".to_string()))?,
+            )
         }
     };
     let container = req.container_name();
@@ -1020,19 +1223,35 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
 
     let result = async {
         match std::fs::remove_file(cron_file(Path::new(CRON_DIR), &req.app_id)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("remove cron file: {e}")),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("remove cron file: {e}"))
+            }
             _ => {}
         }
         let containers = container_names(&req.app_id).await?;
         if !containers.is_empty() {
-            docker(["rm", "-f"].into_iter().map(String::from).chain(containers.iter().cloned())).await?;
+            docker(
+                ["rm", "-f"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain(containers.iter().cloned()),
+            )
+            .await?;
         }
         // Por etiqueta, no por ID: si otra app tiene la misma imagen (mismo
         // repo y commit), solo se le quitan las etiquetas de esta.
-        let listed = docker(["images", &format!("sbapp/{}", req.app_id), "--format", "{{.ID}} {{.Repository}}:{{.Tag}}"]).await?;
+        let listed = docker([
+            "images",
+            &format!("sbapp/{}", req.app_id),
+            "--format",
+            "{{.ID}} {{.Repository}}:{{.Tag}}",
+        ])
+        .await?;
         let mut refs = Vec::new();
         for line in lines(&listed) {
-            let Some((id, r)) = line.split_once(' ') else { continue };
+            let Some((id, r)) = line.split_once(' ') else {
+                continue;
+            };
             if r.ends_with(":<none>") {
                 let _ = docker(["rmi", id]).await;
             } else {
@@ -1040,7 +1259,13 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
             }
         }
         if !refs.is_empty() {
-            docker(["rmi"].into_iter().map(String::from).chain(refs.iter().cloned())).await?;
+            docker(
+                ["rmi"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain(refs.iter().cloned()),
+            )
+            .await?;
         }
         if proxy::caddy_state().await == "running" {
             proxy::delete_route(&req.app_id).await?;
@@ -1180,14 +1405,32 @@ mod tests {
     #[test]
     fn image_retention_keeps_newest_and_current() {
         let imgs = vec![
-            ("2026-10-01T00:00:00Z".to_string(), "sbapp/x:aaaaaaaaaaaa".to_string()),
-            ("2026-10-04T00:00:00Z".to_string(), "sbapp/x:dddddddddddd".to_string()),
-            ("2026-10-02T00:00:00Z".to_string(), "sbapp/x:bbbbbbbbbbbb".to_string()),
-            ("2026-10-03T00:00:00Z".to_string(), "sbapp/x:cccccccccccc".to_string()),
+            (
+                "2026-10-01T00:00:00Z".to_string(),
+                "sbapp/x:aaaaaaaaaaaa".to_string(),
+            ),
+            (
+                "2026-10-04T00:00:00Z".to_string(),
+                "sbapp/x:dddddddddddd".to_string(),
+            ),
+            (
+                "2026-10-02T00:00:00Z".to_string(),
+                "sbapp/x:bbbbbbbbbbbb".to_string(),
+            ),
+            (
+                "2026-10-03T00:00:00Z".to_string(),
+                "sbapp/x:cccccccccccc".to_string(),
+            ),
         ];
-        assert_eq!(images_to_remove(imgs.clone(), 2, "sbapp/x:dddddddddddd"), vec!["sbapp/x:bbbbbbbbbbbb", "sbapp/x:aaaaaaaaaaaa"]);
+        assert_eq!(
+            images_to_remove(imgs.clone(), 2, "sbapp/x:dddddddddddd"),
+            vec!["sbapp/x:bbbbbbbbbbbb", "sbapp/x:aaaaaaaaaaaa"]
+        );
         // Vuelta atrás a una imagen vieja: no se borra aunque quede fuera de las `keep`.
-        assert_eq!(images_to_remove(imgs.clone(), 1, "sbapp/x:aaaaaaaaaaaa"), vec!["sbapp/x:cccccccccccc", "sbapp/x:bbbbbbbbbbbb"]);
+        assert_eq!(
+            images_to_remove(imgs.clone(), 1, "sbapp/x:aaaaaaaaaaaa"),
+            vec!["sbapp/x:cccccccccccc", "sbapp/x:bbbbbbbbbbbb"]
+        );
         assert!(images_to_remove(imgs, 5, "sbapp/x:aaaaaaaaaaaa").is_empty());
     }
 
@@ -1201,8 +1444,14 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        assert_eq!(env_file_content(&env, true), "A=x=y \"quoted\" $HOME 'z' \\n\nEMPTY=\n");
-        assert_eq!(env_file_content(&env, false), "A=x=y \"quoted\" $HOME 'z' \\n\nEMPTY=\nPORT=9999\n");
+        assert_eq!(
+            env_file_content(&env, true),
+            "A=x=y \"quoted\" $HOME 'z' \\n\nEMPTY=\n"
+        );
+        assert_eq!(
+            env_file_content(&env, false),
+            "A=x=y \"quoted\" $HOME 'z' \\n\nEMPTY=\nPORT=9999\n"
+        );
 
         for bad in ["a\nB=evil", "a\r"] {
             let mut v = payload();
@@ -1224,8 +1473,14 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-            assert_eq!(std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
         }
         let root = dir.0.clone();
         drop(dir);
@@ -1262,7 +1517,9 @@ mod tests {
         job.image = format!("sbapp/{APP_ID}:bbbbbbbbbbbb");
         save_cron_job(&cron_dir, APP_ID, &job).unwrap();
 
-        let stored: Value = serde_json::from_str(&std::fs::read_to_string(cron_file(&cron_dir, APP_ID)).unwrap()).unwrap();
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(cron_file(&cron_dir, APP_ID)).unwrap())
+                .unwrap();
         assert_eq!(
             stored,
             json!({
@@ -1275,15 +1532,38 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(cron_file(&cron_dir, APP_ID)).unwrap().permissions().mode() & 0o777, 0o600);
-            assert_eq!(std::fs::metadata(&cron_dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(cron_file(&cron_dir, APP_ID))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&cron_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
         }
 
         // Ficheros ajenos y horarios rotos se ignoran.
         std::fs::write(cron_dir.join("notes.json"), "{}").unwrap();
-        std::fs::write(cron_dir.join("11111111-1111-1111-1111-111111111111.json"), "{").unwrap();
-        let at = |minute, hour| cron::Minute { minute, hour, dom: 15, month: 10, dow: 4 };
-        assert_eq!(due_cron_apps(&cron_dir, at(30, 2)), vec![APP_ID.to_string()]);
+        std::fs::write(
+            cron_dir.join("11111111-1111-1111-1111-111111111111.json"),
+            "{",
+        )
+        .unwrap();
+        let at = |minute, hour| cron::Minute {
+            minute,
+            hour,
+            dom: 15,
+            month: 10,
+            dow: 4,
+        };
+        assert_eq!(
+            due_cron_apps(&cron_dir, at(30, 2)),
+            vec![APP_ID.to_string()]
+        );
         assert!(due_cron_apps(&cron_dir, at(31, 2)).is_empty());
         assert!(due_cron_apps(&dir.0.join("missing"), at(30, 2)).is_empty());
     }

@@ -81,7 +81,10 @@ pub async fn upsert_route(app_id: &str, domain: &str, host_port: u16) -> Result<
         Ok(())
     } else {
         let status = resp.status();
-        Err(format!("Caddy admin API returned {status}: {}", resp.text().await.unwrap_or_default()))
+        Err(format!(
+            "Caddy admin API returned {status}: {}",
+            resp.text().await.unwrap_or_default()
+        ))
     }
 }
 
@@ -135,7 +138,10 @@ async fn listening_ports() -> Result<(Option<String>, Option<String>), String> {
         .await
         .map_err(|e| format!("failed to execute ss: {e}"))?;
     if !out.status.success() {
-        return Err(format!("ss failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!(
+            "ss failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(parse_ss(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -179,7 +185,10 @@ async fn ensure_config() -> Result<(), String> {
                     .map_err(|e| format!("Caddy /load failed: {e}"))?;
                 if !resp.status().is_success() {
                     let status = resp.status();
-                    return Err(format!("Caddy /load returned {status}: {}", resp.text().await.unwrap_or_default()));
+                    return Err(format!(
+                        "Caddy /load returned {status}: {}",
+                        resp.text().await.unwrap_or_default()
+                    ));
                 }
                 return Ok(());
             }
@@ -207,15 +216,23 @@ async fn install() -> Result<Value, String> {
                 docker(["start", CADDY_CONTAINER]).await?;
             } else {
                 docker([
-                    "run", "-d",
-                    "--name", CADDY_CONTAINER,
-                    "--network", "host",
-                    "--restart", "unless-stopped",
-                    "-v", "sb-caddy-data:/data",
+                    "run",
+                    "-d",
+                    "--name",
+                    CADDY_CONTAINER,
+                    "--network",
+                    "host",
+                    "--restart",
+                    "unless-stopped",
+                    "-v",
+                    "sb-caddy-data:/data",
                     // La config autoguardada vive en el mismo volumen que los certificados.
-                    "-e", "XDG_CONFIG_HOME=/data/config",
+                    "-e",
+                    "XDG_CONFIG_HOME=/data/config",
                     CADDY_IMAGE,
-                    "caddy", "run", "--resume",
+                    "caddy",
+                    "run",
+                    "--resume",
                 ])
                 .await?;
             }
@@ -238,7 +255,11 @@ mod tests {
 
     #[test]
     fn route_json_shape() {
-        let r = route_json("11111111-2222-3333-4444-555555555555", "app.ejemplo.com", 20001);
+        let r = route_json(
+            "11111111-2222-3333-4444-555555555555",
+            "app.ejemplo.com",
+            20001,
+        );
         assert_eq!(r["@id"], "sbapp-11111111-2222-3333-4444-555555555555");
         assert_eq!(r["match"][0]["host"][0], "app.ejemplo.com");
         assert_eq!(r["handle"][0]["handler"], "reverse_proxy");
@@ -249,7 +270,10 @@ mod tests {
     fn initial_config_admin_on_loopback() {
         let c = initial_config();
         assert_eq!(c["admin"]["listen"], "127.0.0.1:2019");
-        assert!(c["apps"]["http"]["servers"]["sb"]["routes"].as_array().unwrap().is_empty());
+        assert!(c["apps"]["http"]["servers"]["sb"]["routes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -259,7 +283,10 @@ mod tests {
                    LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:((\"app\",pid=1,fd=3))\n\
                    LISTEN 0 4096 127.0.0.1:2080 0.0.0.0:*\n";
         assert_eq!(parse_ss(out), (Some("nginx".into()), Some("caddy".into())));
-        assert_eq!(parse_ss("LISTEN 0 1 *:80 *:*\n"), (Some("unknown".into()), None));
+        assert_eq!(
+            parse_ss("LISTEN 0 1 *:80 *:*\n"),
+            (Some("unknown".into()), None)
+        );
         assert_eq!(parse_ss(""), (None, None));
     }
 }

@@ -74,17 +74,23 @@ pub fn register(registry: &CommandRegistry) {
         update_now::handle().await
     });
 
-    registry.register("postgres_test_connection", |payload, _progress| async move {
-        tokio::task::spawn_blocking(move || postgres_test_connection(payload))
-            .await
-            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
-    });
+    registry.register(
+        "postgres_test_connection",
+        |payload, _progress| async move {
+            tokio::task::spawn_blocking(move || postgres_test_connection(payload))
+                .await
+                .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+        },
+    );
 
-    registry.register("postgres_collect_metrics", |payload, _progress| async move {
-        tokio::task::spawn_blocking(move || postgres_collect_metrics(payload))
-            .await
-            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
-    });
+    registry.register(
+        "postgres_collect_metrics",
+        |payload, _progress| async move {
+            tokio::task::spawn_blocking(move || postgres_collect_metrics(payload))
+                .await
+                .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+        },
+    );
 
     registry.register("postgres_action", |payload, _progress| async move {
         tokio::task::spawn_blocking(move || postgres_action(payload))
@@ -98,7 +104,6 @@ pub fn register(registry: &CommandRegistry) {
     registry.register("proxy_status", crate::proxy::proxy_status);
     registry.register("proxy_install", crate::proxy::proxy_install);
 }
-
 
 fn list_containers() -> CommandOutcome {
     let has_docker = if cfg!(windows) {
@@ -569,7 +574,6 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
         Err(e) => return CommandOutcome::failed(format!("Invalid arguments: {e}")),
     };
 
-
     // 1. Version
     let version = match execute_psql(&args, "SELECT version();") {
         Ok(v) => v,
@@ -593,20 +597,27 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
     let active_conn: i64 = conn_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let idle_conn: i64 = conn_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     let idle_in_tx: i64 = conn_parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_conn: i64 = conn_parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(100);
+    let max_conn: i64 = conn_parts
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
 
     // 3. Tamaño de base de datos y Cache Hit Ratio
     let size_sql = "SELECT pg_database_size(current_database()) || '|' || coalesce(round(sum(blks_hit) * 100.0 / nullif(sum(blks_hit + blks_read), 0), 2), 100.0) FROM pg_stat_database WHERE datname = current_database();";
     let size_stats = execute_psql(&args, size_sql).unwrap_or_default();
     let size_parts: Vec<&str> = size_stats.split('|').collect();
     let db_bytes: i64 = size_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let cache_hit_pct: f64 = size_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(100.0);
+    let cache_hit_pct: f64 = size_parts
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100.0);
 
     // 4. Slow queries (from pg_stat_statements, excluding backup COPY streams)
     let slow_queries_sql = "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT query, calls, round(total_exec_time::numeric, 2) as total_exec_time, round(mean_exec_time::numeric, 2) as mean_exec_time, round(min_exec_time::numeric, 2) as min_exec_time, round(max_exec_time::numeric, 2) as max_exec_time, rows FROM pg_stat_statements WHERE query NOT ILIKE 'COPY %' ORDER BY total_exec_time DESC LIMIT 10) t;";
     let (has_stat_statements, slow_queries_json) = match execute_psql(&args, slow_queries_sql) {
         Ok(raw) => {
-            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
             (true, parsed)
         }
         Err(_) => (false, json!([])),
@@ -687,7 +698,9 @@ pub struct PostgresActionArgs {
 }
 
 fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
 fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
@@ -705,9 +718,12 @@ fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
             let sql = format!("SELECT pg_cancel_backend({pid});");
             match execute_psql(&args.conn, &sql) {
                 Ok(res) => CommandOutcome::ok(
-                    json!({ "success": true, "action": "cancel_query", "pid": pid, "result": res }).to_string(),
+                    json!({ "success": true, "action": "cancel_query", "pid": pid, "result": res })
+                        .to_string(),
                 ),
-                Err(e) => CommandOutcome::failed(format!("Failed to cancel query for PID {pid}: {e}")),
+                Err(e) => {
+                    CommandOutcome::failed(format!("Failed to cancel query for PID {pid}: {e}"))
+                }
             }
         }
         "terminate_connection" => {
@@ -731,7 +747,8 @@ fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
             let sql = format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\";");
             match execute_psql(&args.conn, &sql) {
                 Ok(_) => CommandOutcome::ok(
-                    json!({ "success": true, "action": "install_extension", "extension": ext }).to_string(),
+                    json!({ "success": true, "action": "install_extension", "extension": ext })
+                        .to_string(),
                 ),
                 Err(e) => CommandOutcome::failed(format!("Failed to install extension {ext}: {e}")),
             }
@@ -744,7 +761,8 @@ fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
             let sql = format!("VACUUM (ANALYZE) {table};");
             match execute_psql(&args.conn, &sql) {
                 Ok(_) => CommandOutcome::ok(
-                    json!({ "success": true, "action": "vacuum_table", "table": table }).to_string(),
+                    json!({ "success": true, "action": "vacuum_table", "table": table })
+                        .to_string(),
                 ),
                 Err(e) => CommandOutcome::failed(format!("Failed to vacuum table {table}: {e}")),
             }
@@ -757,7 +775,8 @@ fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
             let sql = format!("REINDEX TABLE CONCURRENTLY {table};");
             match execute_psql(&args.conn, &sql) {
                 Ok(_) => CommandOutcome::ok(
-                    json!({ "success": true, "action": "reindex_table", "table": table }).to_string(),
+                    json!({ "success": true, "action": "reindex_table", "table": table })
+                        .to_string(),
                 ),
                 Err(e) => CommandOutcome::failed(format!("Failed to reindex table {table}: {e}")),
             }
@@ -765,5 +784,3 @@ fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
         other => CommandOutcome::failed(format!("Unsupported action: {other}")),
     }
 }
-
-
