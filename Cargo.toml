@@ -8,7 +8,7 @@ description = "Deploy agent for SecuryBlack — pulls an OCI image and reconcile
 repository = "https://github.com/securyblack/cromo-forge"
 
 [dependencies]
-sb-agent-core = { git = "https://github.com/securyblack/sb-agent-core", branch = "master" }
+sb-agent-core = { git = "https://github.com/securyblack/sb-agent-core", tag = "v0.4.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "io-util", "fs"] }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
