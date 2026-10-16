@@ -589,7 +589,7 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
     let conn_sql = "SELECT count(*) || '|' || count(*) FILTER (WHERE state = 'active') || '|' || count(*) FILTER (WHERE state = 'idle') || '|' || count(*) FILTER (WHERE state = 'idle in transaction') || '|' || (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') FROM pg_stat_activity;";
     let conn_stats = execute_psql(&args, conn_sql).unwrap_or_default();
     let conn_parts: Vec<&str> = conn_stats.split('|').collect();
-    let total_conn: i64 = conn_parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let total_conn: i64 = conn_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let active_conn: i64 = conn_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let idle_conn: i64 = conn_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     let idle_in_tx: i64 = conn_parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -599,7 +599,7 @@ fn postgres_collect_metrics(payload: serde_json::Value) -> CommandOutcome {
     let size_sql = "SELECT pg_database_size(current_database()) || '|' || coalesce(round(sum(blks_hit) * 100.0 / nullif(sum(blks_hit + blks_read), 0), 2), 100.0) FROM pg_stat_database WHERE datname = current_database();";
     let size_stats = execute_psql(&args, size_sql).unwrap_or_default();
     let size_parts: Vec<&str> = size_stats.split('|').collect();
-    let db_bytes: i64 = size_parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let db_bytes: i64 = size_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let cache_hit_pct: f64 = size_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(100.0);
 
     // 4. Slow queries (from pg_stat_statements, excluding backup COPY streams)

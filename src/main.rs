@@ -98,7 +98,7 @@ fn check_version_arg() {
 #[cfg(windows)]
 fn main() {
     check_version_arg();
-    match service::windows::run_service(SERVICE_DISPLAY_NAME, |rx| run(rx)) {
+    match service::windows::run_service(SERVICE_DISPLAY_NAME, run) {
         Ok(_) => {}
         Err(e) if service::windows::is_not_started_by_scm(&e) => {
             service::run_console(run);
