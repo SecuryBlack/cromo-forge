@@ -46,6 +46,8 @@ Part of the SecuryBlack native agent family: [OxiPulse](https://github.com/Secur
 curl -fsSL https://install.cromoforge.dev | sudo bash
 ```
 
+Git deployments require Docker Engine with the buildx plugin; the installer does not install Docker. It does install a pinned, checksum-verified [Railpack](https://github.com/railwayapp/railpack) binary to `/usr/local/bin/railpack`.
+
 ### Windows — PowerShell (Administrator)
 ```powershell
 irm https://install.cromoforge.dev | iex
