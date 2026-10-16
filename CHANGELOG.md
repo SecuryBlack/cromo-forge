@@ -5,12 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-16
 
 ### Added
 - **Deployments**: `deploy_app` command — fetches a GitHub commit tarball, builds it with Railpack against a resource-capped BuildKit container (`sb-buildkit`), starts it as `sbapp-<app>-<deployment>`, healthchecks it (HTTP for `web`, 30 s stability for `worker`), switches the Caddy route and keeps the newest `keep_images` images. Streams `build_log` lines and stage heartbeats; rollbacks reuse an existing `sbapp/<app>` image. One deployment at a time per app.
 - **Deployments**: `remove_app` command — removes an app's containers, images and Caddy route.
 - **Proxy**: `proxy_status` and `proxy_install` commands — SB-managed Caddy (`sb-caddy`, host network, admin API on `127.0.0.1:2019`) with automatic HTTPS.
+- **Deployments**: `cron` apps — the schedule (5 fields, UTC) lives in `/var/lib/cromoforge/cron/<app>.json`; each run starts `sbapp-<app>-run` and a run is skipped while the previous one is still going.
+- **Deployments**: App secrets reach the container through a 0600 `--env-file` that is deleted right after `docker run`, never through argv.
+- **Deployments**: BuildKit cache is pruned after each build to a size that depends on the disk, and its state lives in the named volume `sb-buildkit-state`.
+- **Install**: `install.sh` installs Railpack.
+
+### Security
+- **Commands**: Verify S4 signed commands (ed25519 signature, expiry, replay protection) via `sb-agent-core` 0.4 `command_intake`. During the transition any verification failure (unsigned, invalid or expired) is accepted with a warning.
+
+### Fixed
+- **Deployments**: `remove_app` untags only the app's own images, so an image shared with another app no longer makes it fail and leave the Caddy route behind.
 
 ## [0.1.5] - 2026-10-14
 
@@ -47,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Commands**: Unix domain socket command intake and `docker_list_containers` handler.
 - **Core**: Built on top of `sb-agent-core` with structured logging and CLI.
 
-[Unreleased]: https://github.com/SecuryBlack/cromo-forge/compare/v0.1.5...HEAD
+[0.2.0]: https://github.com/SecuryBlack/cromo-forge/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/SecuryBlack/cromo-forge/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/SecuryBlack/cromo-forge/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/SecuryBlack/cromo-forge/compare/v0.1.2...v0.1.3
