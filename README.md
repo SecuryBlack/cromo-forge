@@ -1,6 +1,6 @@
 # CromoForge
 
-Rust agent for Docker container lifecycle/logs and PostgreSQL management on Linux and Windows. GitOps reconciliation, sealed secrets and atomic rollout/rollback remain planned. See the [workspace wiki](../sb-wiki/Producto/Estado%20actual.md) for verified capability status.
+Rust agent for Docker container lifecycle/logs, PostgreSQL management and GitHub app deployments (early access) on Linux and Windows. See the [workspace wiki](../sb-wiki/Producto/Estado%20actual.md) for verified capability status.
 
 ## Use with SecuryBlack
 
@@ -30,12 +30,19 @@ Part of the SecuryBlack native agent family: [OxiPulse](https://github.com/Secur
 
 ---
 
-## Planned architecture (not implemented yet)
+## What it does (v0.2.0)
 
-- **Registry-First Delivery:** Production deployments perform `pull` + `up` + health check + rollback. Container images are built in CI pipelines and fetched from registries rather than built on production host servers.
-- **Reconciliation Engine:** State convergence loop (desired state → observed state → convergence) supporting pluggable sources: `securyblack` (via Conduit tunnel), `git` (declarative GitOps), and `local` (`cromoforge.toml`).
-- **Sealed Secrets:** Build arguments separated from runtime secrets sealed with X25519 asymmetric cryptography.
-- **Zero-Downtime Atomic Rollout:** Starts the new container instance, verifies health check probes, seamlessly shifts traffic, and stops the prior version. If probes fail, instant rollback restores the previous version immediately.
+CromoForge receives commands from the SecuryBlack panel through the companion agent and runs them against the local Docker daemon. See [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](.github/SECURITY.md) for details.
+
+- **GitHub app deploys (early access, Linux):** `deploy_app` downloads the commit tarball from GitHub, builds it with [Railpack](https://github.com/railwayapp/railpack) against a resource-capped BuildKit container (`sb-buildkit`), starts the new container, healthchecks it and only then switches traffic and removes the old one. Deploys can be triggered on every push from the panel.
+- **App types:** `web` (HTTP healthcheck, routed through Caddy), `worker` (30 s stability check) and `cron` (5-field UTC schedule; a run is skipped while the previous one is still going).
+- **Rollback:** redeploys an existing `sbapp/<app>` image without rebuilding; the newest `keep_images` images are kept.
+- **Custom domains:** an SB-managed Caddy (`sb-caddy`) publishes web apps on their domain with automatic HTTPS from Let's Encrypt.
+- **Secrets:** app environment variables reach the container through a `0600` env file that is deleted right after `docker run`, never through argv.
+- **BuildKit cache cleanup:** the build cache is pruned after each build to a size based on free disk.
+- **Docker:** list, start, stop and restart containers, and tail their logs.
+- **PostgreSQL:** connection test, metrics (connections, size, cache hit, slow queries, bloat, unused indexes) and actions (cancel/terminate backends, `VACUUM`, `REINDEX CONCURRENTLY`).
+- **Signed commands:** ed25519-signed commands from the SecuryBlack API are verified (expiry and replay protection). During the transition, unsigned or invalid commands are still accepted with a warning.
 
 ---
 
