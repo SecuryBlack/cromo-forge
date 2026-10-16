@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use tracing::info;
 
 const AGENT_NAME: &str = "cromoforge";
+#[cfg(windows)]
 const SERVICE_DISPLAY_NAME: &str = "CromoForge";
 
 async fn run(mut shutdown: oneshot::Receiver<()>) {
