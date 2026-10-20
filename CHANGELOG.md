@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-20
+
+### Added
+- **Proxy**: Extra domains per app (`app.aliases` in `deploy_app`). Every domain gets its own certificate; aliases with `redirect` answer a 308 to the primary domain keeping path and query (`www` ↔ apex), the rest serve the app too. Still one Caddy route per app (`sbapp-<app>`).
+
+### Fixed
+- **Proxy**: Deploying a web app without a domain now removes its Caddy route, which used to keep pointing at the stopped container.
+
 ## [0.2.0] - 2026-10-16
 
 ### Added
