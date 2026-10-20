@@ -1,7 +1,7 @@
 //! Despliegues desde git (Fase 1): `deploy_app` y `remove_app`.
 //!
 //! El camino de `deploy_app` es fetch (tarball de GitHub) → build (Railpack
-//! contra el BuildKit `sb-buildkit`) → start → healthcheck → switch (ruta de
+//! o el Dockerfile del repo, contra el BuildKit `sb-buildkit`) → start → healthcheck → switch (ruta de
 //! Caddy) → cleanup. Las apps `cron` paran tras el build: guardan su horario
 //! en `CRON_DIR` y las lanza `run_due_cron_jobs` cada minuto. Formatos, nombres en Docker y etapas de progreso están
 //! fijados en `sb-wiki/Tecnica/Fase 1 - Contrato de despliegues.md`; si algo
@@ -70,6 +70,29 @@ struct AppSpec {
     /// Solo en `cron`: 5 campos, UTC.
     #[serde(default)]
     schedule: Option<String>,
+    /// Sin el campo (API anterior) se construye como siempre: Railpack en la raíz.
+    #[serde(default)]
+    builder: Builder,
+    /// Carpeta del repo donde se construye (monorepos); `None` es la raíz.
+    #[serde(default)]
+    root_dir: Option<String>,
+    /// Relativo a `root_dir`.
+    #[serde(default = "default_dockerfile_path")]
+    dockerfile_path: String,
+    #[serde(default)]
+    install_command: Option<String>,
+    #[serde(default)]
+    build_command: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+enum Builder {
+    /// Dockerfile si existe en la carpeta de build; si no, Railpack.
+    Auto,
+    #[default]
+    Railpack,
+    Dockerfile,
 }
 
 /// Sin `Debug` a propósito: lleva el token de instalación de GitHub.
@@ -108,6 +131,9 @@ fn default_healthcheck_timeout() -> u64 {
 }
 fn default_keep_images() -> usize {
     3
+}
+fn default_dockerfile_path() -> String {
+    "Dockerfile".to_string()
 }
 
 /// UUID en minúsculas (`sbapp/<id>` va en un nombre de imagen, que no admite mayúsculas).
@@ -173,6 +199,26 @@ fn is_healthcheck_path(s: &str) -> bool {
     s.starts_with('/') && s.len() <= 1024 && s.chars().all(|c| c.is_ascii_graphic())
 }
 
+/// Ruta relativa dentro del repo (`root_dir`, `dockerfile_path`): segmentos
+/// `[A-Za-z0-9._@+-]` separados por `/`, sin `.` ni `..`. Los enlaces
+/// simbólicos se comprueban después, en `resolve_inside`.
+fn is_rel_path(s: &str) -> bool {
+    (1..=255).contains(&s.len())
+        && s.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg != "."
+                && seg != ".."
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._@+-".contains(c))
+        })
+}
+
+/// Comandos a medida: una línea de como mucho 1000 caracteres.
+fn is_command(s: &str) -> bool {
+    !s.trim().is_empty() && s.chars().count() <= 1000 && !s.chars().any(char::is_control)
+}
+
 /// Tokens de instalación (`ghs_...`): van en una cabecera, así que nada de
 /// espacios ni saltos de línea.
 fn is_token(s: &str) -> bool {
@@ -215,10 +261,25 @@ impl DeployRequest {
                 return Err("invalid app.aliases".into());
             }
         }
-        if let Some(cmd) = &app.start_command {
-            if cmd.is_empty() || cmd.len() > 4096 || cmd.contains('\0') {
-                return Err("invalid app.start_command".into());
+        for (field, cmd) in [
+            ("start_command", &app.start_command),
+            ("install_command", &app.install_command),
+            ("build_command", &app.build_command),
+        ] {
+            if cmd.as_deref().is_some_and(|c| !is_command(c)) {
+                return Err(format!("invalid app.{field}"));
             }
+        }
+        if app.builder == Builder::Dockerfile
+            && (app.install_command.is_some() || app.build_command.is_some())
+        {
+            return Err("install and build commands only apply to Railpack builds".into());
+        }
+        if app.root_dir.as_deref().is_some_and(|d| !is_rel_path(d)) {
+            return Err("invalid app.root_dir".into());
+        }
+        if !is_rel_path(&app.dockerfile_path) {
+            return Err("invalid app.dockerfile_path".into());
         }
         if app.kind == AppKind::Cron {
             let schedule = app
@@ -473,6 +534,69 @@ fn images_to_remove(mut images: Vec<(String, String)>, keep: usize, current: &st
 // Etapas
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `base/rel` tras resolver enlaces simbólicos, solo si sigue dentro de
+/// `base`: un repo puede traer `app -> /` y no se construye el disco del host.
+fn resolve_inside(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    let base = base
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", base.display()))?;
+    let path = base
+        .join(rel)
+        .canonicalize()
+        .map_err(|_| format!("{rel} not found in the repository"))?;
+    if !path.starts_with(&base) {
+        return Err(format!("{rel} points outside the repository"));
+    }
+    Ok(path)
+}
+
+/// Carpeta de build y, si se construye con Dockerfile, su ruta relativa a
+/// esa carpeta (con `/`).
+fn build_plan(repo: &Path, app: &AppSpec) -> Result<(PathBuf, Option<String>), String> {
+    let dir = resolve_inside(repo, app.root_dir.as_deref().unwrap_or("."))?;
+    if !dir.is_dir() {
+        return Err(format!(
+            "root directory {} is not a directory",
+            app.root_dir.as_deref().unwrap_or(".")
+        ));
+    }
+    let wants_dockerfile = match app.builder {
+        Builder::Railpack => false,
+        Builder::Auto => dir.join(&app.dockerfile_path).exists(),
+        Builder::Dockerfile => true,
+    };
+    if !wants_dockerfile {
+        return Ok((dir, None));
+    }
+    let file = resolve_inside(&dir, &app.dockerfile_path)?;
+    if !file.is_file() {
+        return Err(format!("{} is not a file", app.dockerfile_path));
+    }
+    let rel = file
+        .strip_prefix(&dir)
+        .map_err(|_| format!("{} points outside the root directory", app.dockerfile_path))?
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((dir, Some(rel)))
+}
+
+/// Argumentos de `docker run` desde la imagen: con `start_command`, el
+/// comando sustituye a ENTRYPOINT y CMD, igual para Railpack y Dockerfile.
+fn image_and_command(image: &str, start_command: Option<&str>) -> Vec<String> {
+    match start_command {
+        Some(cmd) => vec![
+            "--entrypoint".into(),
+            "/bin/sh".into(),
+            image.into(),
+            "-c".into(),
+            cmd.into(),
+        ],
+        None => vec![image.into()],
+    }
+}
+
 /// Directorio de trabajo del build; se borra al soltarse (también si la
 /// orden caduca). En `/var/tmp` y no en `/tmp`, que suele ser tmpfs.
 struct WorkDir(PathBuf);
@@ -638,11 +762,14 @@ async fn ensure_buildkit(p: &Progress) -> Result<(), String> {
 /// ponytail: flags sacados de railpack.com (CLI reference + getting started);
 /// según la doc, el CLI hace `docker load` del resultado con el nombre de
 /// `--name`. Verificar en la prueba del paso 0 en el HomeLab.
+/// `install_command` y `build_command` van como las variables de config
+/// `RAILPACK_INSTALL_CMD` / `RAILPACK_BUILD_CMD` (también ponytail: de la doc,
+/// sin probar contra un Railpack real).
 async fn railpack_build(
     dir: &Path,
     image: &str,
     build_env: &BTreeMap<String, String>,
-    start_command: Option<&str>,
+    app: &AppSpec,
     p: &Progress,
 ) -> Result<(), String> {
     let mut cmd = Command::new("railpack");
@@ -652,7 +779,14 @@ async fn railpack_build(
     for (k, v) in build_env {
         cmd.arg("--env").arg(format!("{k}={v}"));
     }
-    if let Some(start) = start_command {
+    if let Some(install) = &app.install_command {
+        cmd.arg("--env")
+            .arg(format!("RAILPACK_INSTALL_CMD={install}"));
+    }
+    if let Some(build) = &app.build_command {
+        cmd.arg("--env").arg(format!("RAILPACK_BUILD_CMD={build}"));
+    }
+    if let Some(start) = &app.start_command {
         cmd.args(["--start-cmd", start]);
     }
     cmd.env(
@@ -660,6 +794,113 @@ async fn railpack_build(
         format!("docker-container://{BUILDKIT_CONTAINER}"),
     );
     run_streamed(cmd, "railpack", p).await
+}
+
+/// Copia de la carpeta de build dentro de `sb-buildkit`; se borra al soltarse
+/// (también si la orden caduca).
+struct BuildkitCopy(String);
+
+impl Drop for BuildkitCopy {
+    fn drop(&mut self) {
+        // En segundo plano: `drop` no puede esperar a un proceso async.
+        let _ = std::process::Command::new("docker")
+            .args(["exec", BUILDKIT_CONTAINER, "rm", "-rf", &self.0])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+/// Build con el Dockerfile del repo: `buildctl` con el frontend
+/// `dockerfile.v0` dentro de `sb-buildkit` (mismos límites y caché que
+/// Railpack). El host no tiene `buildctl`, así que el contexto se copia al
+/// contenedor y la imagen vuelve por tubería a `docker load`.
+async fn dockerfile_build(
+    dir: &Path,
+    dockerfile: &str,
+    image: &str,
+    build_env: &BTreeMap<String, String>,
+    deployment_id: &str,
+    p: &Progress,
+) -> Result<(), String> {
+    let ctx = BuildkitCopy(format!("/tmp/sb-build-{deployment_id}"));
+    docker(["exec", BUILDKIT_CONTAINER, "rm", "-rf", &ctx.0]).await?;
+    let mut src = dir.as_os_str().to_owned();
+    src.push("/.");
+    docker([
+        OsStr::new("cp"),
+        &src,
+        OsStr::new(&format!("{BUILDKIT_CONTAINER}:{}", ctx.0)),
+    ])
+    .await?;
+    let (df_dir, df_name) = match dockerfile.rsplit_once('/') {
+        Some((d, f)) => (format!("{}/{d}", ctx.0), f),
+        None => (ctx.0.clone(), dockerfile),
+    };
+
+    let mut build = Command::new("docker");
+    build
+        .args(["exec", BUILDKIT_CONTAINER, "buildctl", "build"])
+        .args(["--frontend", "dockerfile.v0", "--progress", "plain"])
+        .arg("--local")
+        .arg(format!("context={}", ctx.0))
+        .arg("--local")
+        .arg(format!("dockerfile={df_dir}"))
+        .arg("--opt")
+        .arg(format!("filename={df_name}"));
+    for (k, v) in build_env {
+        build.arg("--opt").arg(format!("build-arg:{k}={v}"));
+    }
+    build
+        .arg("--output")
+        .arg(format!("type=docker,name={image}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut build = build
+        .spawn()
+        .map_err(|e| format!("failed to execute docker: {e}"))?;
+    let tar: Stdio = build
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .try_into()
+        .map_err(|e| format!("pipe: {e}"))?;
+    let mut load = Command::new("docker")
+        .arg("load")
+        .stdin(tar)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to execute docker: {e}"))?;
+    let build_err = build.stderr.take().expect("piped stderr");
+    let load_out = load.stdout.take().expect("piped stdout");
+    let load_err = load.stderr.take().expect("piped stderr");
+    let (build_tail, _, load_tail, build_status, load_status) = tokio::join!(
+        pump(build_err, p),
+        pump(load_out, p),
+        pump(load_err, p),
+        build.wait(),
+        load.wait()
+    );
+    let build_status = build_status.map_err(|e| format!("buildctl: {e}"))?;
+    if !build_status.success() {
+        return Err(format!(
+            "buildctl exited with {build_status}:\n{}",
+            Vec::from(build_tail).join("\n")
+        ));
+    }
+    let load_status = load_status.map_err(|e| format!("docker load: {e}"))?;
+    if !load_status.success() {
+        return Err(format!(
+            "docker load exited with {load_status}:\n{}",
+            Vec::from(load_tail).join("\n")
+        ));
+    }
+    Ok(())
 }
 
 /// Puertos de host ya publicados por contenedores en marcha.
@@ -704,7 +945,7 @@ async fn start_container(
         args.push("-e".into());
         args.push(format!("PORT={}", app.port));
     }
-    args.push(image.into());
+    args.extend(image_and_command(image, app.start_command.as_deref()));
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
     result
@@ -1055,7 +1296,8 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
     .map(String::from)
     .into();
     args.extend(log_rotation().await);
-    args.extend([String::from("--env-file"), env_path, job.image.clone()]);
+    args.extend([String::from("--env-file"), env_path]);
+    args.extend(image_and_command(&job.image, job.start_command.as_deref()));
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
     if result.is_ok() {
@@ -1134,16 +1376,19 @@ async fn run_deploy(
             let dir = fetch_source(src, &work.0).await.map_err(at("fetch"))?;
 
             p.stage("build", "Building image");
+            let (dir, dockerfile) = build_plan(&dir, app).map_err(at("build"))?;
             ensure_buildkit(p).await.map_err(at("build"))?;
             let image = format!("sbapp/{}:{}", app.id, &src.sha[..12]);
-            railpack_build(
-                &dir,
-                &image,
-                &req.build_env,
-                app.start_command.as_deref(),
-                p,
-            )
-            .await
+            match &dockerfile {
+                Some(df) => {
+                    p.log(&format!("Building with {df}"));
+                    if app.install_command.is_some() || app.build_command.is_some() {
+                        p.log("Install and build commands are ignored with a Dockerfile");
+                    }
+                    dockerfile_build(&dir, df, &image, &req.build_env, &req.deployment_id, p).await
+                }
+                None => railpack_build(&dir, &image, &req.build_env, app, p).await,
+            }
             .map_err(at("build"))?;
             if let Err(e) = prune_buildkit().await {
                 tracing::warn!(app_id = %app.id, "buildkit prune failed: {e}");
@@ -1426,6 +1671,113 @@ mod tests {
             v["env"] = json!({ key: "x" });
             assert!(validate(v).is_err(), "env key {key:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn build_fields_are_validated() {
+        let r = validate(payload()).unwrap();
+        assert_eq!(
+            r.app.builder,
+            Builder::Railpack,
+            "API anterior sin el campo"
+        );
+        assert_eq!(r.app.dockerfile_path, "Dockerfile");
+
+        let mut v = payload();
+        v["app"]["builder"] = json!("auto");
+        v["app"]["root_dir"] = json!("apps/web");
+        v["app"]["dockerfile_path"] = json!("docker/Dockerfile.prod");
+        v["app"]["install_command"] = json!("pnpm i --frozen-lockfile");
+        v["app"]["start_command"] = json!("node server.js");
+        assert!(validate(v.clone()).is_ok());
+
+        let cases: Vec<(&str, Value)> = vec![
+            ("/app/builder", json!("nixpacks")),
+            ("/app/root_dir", json!("../x")),
+            ("/app/root_dir", json!("/etc")),
+            ("/app/root_dir", json!("a/./b")),
+            ("/app/root_dir", json!("a//b")),
+            ("/app/root_dir", json!("a\\b")),
+            ("/app/root_dir", json!("x".repeat(256))),
+            ("/app/dockerfile_path", json!("")),
+            ("/app/dockerfile_path", json!("../Dockerfile")),
+            ("/app/install_command", json!("a\nb")),
+            ("/app/start_command", json!("")),
+            ("/app/start_command", json!("x".repeat(1001))),
+        ];
+        for (ptr, bad) in cases {
+            let mut w = v.clone();
+            *w.pointer_mut(ptr).unwrap() = bad.clone();
+            assert!(validate(w).is_err(), "{ptr} = {bad} should be rejected");
+        }
+        v["app"]["builder"] = json!("dockerfile");
+        assert!(validate(v).is_err(), "install_command con Dockerfile");
+    }
+
+    #[test]
+    fn build_plan_picks_builder_and_stays_inside_repo() {
+        let work = WorkDir::new("test-plan", &format!("{}", std::process::id())).unwrap();
+        let repo = work.0.join("repo");
+        std::fs::create_dir_all(repo.join("apps/api/docker")).unwrap();
+        std::fs::create_dir_all(repo.join("apps/web")).unwrap();
+        std::fs::write(repo.join("apps/api/docker/Dockerfile.prod"), "FROM scratch").unwrap();
+        std::fs::write(repo.join("apps/web/Dockerfile"), "FROM scratch").unwrap();
+        std::fs::write(repo.join("README"), "").unwrap();
+
+        let plan = |builder: &str, root: Value, df: &str| {
+            let mut v = payload();
+            v["app"]["builder"] = json!(builder);
+            v["app"]["root_dir"] = root;
+            v["app"]["dockerfile_path"] = json!(df);
+            build_plan(&repo, &validate(v).unwrap().app)
+        };
+        let canon = |p: &str| repo.join(p).canonicalize().unwrap();
+
+        // auto: Dockerfile si existe; si no, Railpack.
+        assert_eq!(
+            plan("auto", json!("apps/web"), "Dockerfile").unwrap(),
+            (canon("apps/web"), Some("Dockerfile".into()))
+        );
+        assert_eq!(
+            plan("auto", Value::Null, "Dockerfile").unwrap(),
+            (canon("."), None)
+        );
+        assert_eq!(
+            plan("railpack", json!("apps/web"), "Dockerfile").unwrap().1,
+            None
+        );
+        assert_eq!(
+            plan("dockerfile", json!("apps/api"), "docker/Dockerfile.prod")
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("docker/Dockerfile.prod")
+        );
+        // dockerfile sin fichero, carpeta que no existe o que es un fichero.
+        assert!(plan("dockerfile", Value::Null, "Dockerfile").is_err());
+        assert!(plan("auto", json!("apps/nope"), "Dockerfile").is_err());
+        assert!(plan("auto", json!("README"), "Dockerfile").is_err());
+
+        #[cfg(unix)]
+        {
+            let outside = work.0.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("Dockerfile"), "FROM scratch").unwrap();
+            std::os::unix::fs::symlink(&outside, repo.join("escape")).unwrap();
+            std::os::unix::fs::symlink(outside.join("Dockerfile"), repo.join("apps/web/Evil"))
+                .unwrap();
+            assert!(plan("auto", json!("escape"), "Dockerfile").is_err());
+            assert!(plan("dockerfile", json!("apps/web"), "Evil").is_err());
+        }
+    }
+
+    #[test]
+    fn start_command_overrides_entrypoint() {
+        assert_eq!(image_and_command("img", None), vec!["img"]);
+        assert_eq!(
+            image_and_command("img", Some("node server.js")),
+            vec!["--entrypoint", "/bin/sh", "img", "-c", "node server.js"]
+        );
     }
 
     #[test]
