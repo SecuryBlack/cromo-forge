@@ -62,6 +62,9 @@ struct AppSpec {
     healthcheck_timeout_secs: u64,
     #[serde(default)]
     domain: Option<String>,
+    /// Dominios extra de `domain`; con `redirect` responden 308 al principal.
+    #[serde(default)]
+    aliases: Vec<proxy::Alias>,
     #[serde(default)]
     start_command: Option<String>,
     /// Solo en `cron`: 5 campos, UTC.
@@ -201,6 +204,15 @@ impl DeployRequest {
             *d = d.to_ascii_lowercase();
             if !is_domain(d) {
                 return Err("invalid app.domain".into());
+            }
+        }
+        if !app.aliases.is_empty() && app.domain.is_none() {
+            return Err("app.aliases needs app.domain".into());
+        }
+        for a in &mut app.aliases {
+            a.domain = a.domain.to_ascii_lowercase();
+            if !is_domain(&a.domain) || Some(&a.domain) == app.domain.as_ref() {
+                return Err("invalid app.aliases".into());
             }
         }
         if let Some(cmd) = &app.start_command {
@@ -1187,12 +1199,17 @@ async fn run_deploy(
     if let (Some(hp), Some(domain)) = (host_port, &app.domain) {
         p.stage("switch", "Switching traffic");
         if proxy::caddy_state().await == "running" {
-            if let Err(e) = proxy::upsert_route(&app.id, domain, hp).await {
+            if let Err(e) = proxy::upsert_route(&app.id, domain, &app.aliases, hp).await {
                 let _ = docker(["rm", "-f", &container]).await;
                 return Err(("switch", e));
             }
         } else {
             p.log("Proxy not installed, route not changed");
+        }
+    } else if host_port.is_some() && proxy::caddy_state().await == "running" {
+        // Se quitó el dominio: la ruta apuntaría al contenedor que se para ahora.
+        if let Err(e) = proxy::delete_route(&app.id).await {
+            p.log(&format!("proxy: {e}"));
         }
     }
 
@@ -1322,6 +1339,26 @@ mod tests {
         assert_eq!(r.app.domain.as_deref(), Some("app.ejemplo.com"));
         assert_eq!(r.container_name(), format!("sbapp-{APP_ID}-9f8e7d6c"));
         assert_eq!(r.app.kind, AppKind::Web);
+        assert!(r.app.aliases.is_empty());
+    }
+
+    #[test]
+    fn aliases_are_normalized_and_need_a_primary_domain() {
+        let mut v = payload();
+        v["app"]["aliases"] = json!([{ "domain": "WWW.app.ejemplo.com", "redirect": true }]);
+        let r = validate(v.clone()).unwrap();
+        assert_eq!(r.app.aliases[0].domain, "www.app.ejemplo.com");
+        assert!(r.app.aliases[0].redirect);
+        for bad in [
+            json!([{ "domain": "app.ejemplo.com" }]),
+            json!([{ "domain": "localhost" }]),
+        ] {
+            v["app"]["aliases"] = bad;
+            assert!(validate(v.clone()).is_err());
+        }
+        v["app"]["aliases"] = json!([{ "domain": "www.a.com" }]);
+        v["app"]["domain"] = Value::Null;
+        assert!(validate(v).is_err());
     }
 
     #[test]

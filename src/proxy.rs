@@ -8,6 +8,7 @@
 
 use crate::deploy::{docker, local_http};
 use sb_agent_core::command_intake::{CommandOutcome, ProgressSender};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -31,15 +32,59 @@ fn route_id(app_id: &str) -> String {
     format!("sbapp-{app_id}")
 }
 
-/// Ruta de una app: host exacto → reverse_proxy al puerto local del contenedor.
-pub fn route_json(app_id: &str, domain: &str, host_port: u16) -> Value {
+/// Dominio extra de una app. `redirect` (por defecto) responde 308 al
+/// dominio principal conservando ruta y query; si no, sirve la app igual.
+#[derive(Debug, Deserialize)]
+pub struct Alias {
+    pub domain: String,
+    #[serde(default = "yes")]
+    pub redirect: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Ruta de una app: sus hosts → reverse_proxy al puerto local del contenedor.
+/// Los alias con redirección van en una subruta delante, dentro de la misma
+/// ruta, así que la app sigue teniendo un solo `@id`. Todos los hosts están
+/// en el `match` de fuera, que es de donde Caddy saca los certificados.
+pub fn route_json(app_id: &str, domain: &str, aliases: &[Alias], host_port: u16) -> Value {
+    let proxy = json!({
+        "handler": "reverse_proxy",
+        "upstreams": [{ "dial": format!("127.0.0.1:{host_port}") }]
+    });
+    let redirects: Vec<&str> = aliases
+        .iter()
+        .filter(|a| a.redirect)
+        .map(|a| a.domain.as_str())
+        .collect();
+    let handle = if redirects.is_empty() {
+        proxy
+    } else {
+        json!({
+            "handler": "subroute",
+            "routes": [
+                {
+                    "match": [{ "host": redirects }],
+                    "handle": [{
+                        "handler": "static_response",
+                        "status_code": 308,
+                        "headers": { "Location": [format!("https://{domain}{{http.request.uri}}")] }
+                    }],
+                    "terminal": true
+                },
+                { "handle": [proxy] }
+            ]
+        })
+    };
+    let hosts: Vec<&str> = std::iter::once(domain)
+        .chain(aliases.iter().map(|a| a.domain.as_str()))
+        .collect();
     json!({
         "@id": route_id(app_id),
-        "match": [{ "host": [domain] }],
-        "handle": [{
-            "handler": "reverse_proxy",
-            "upstreams": [{ "dial": format!("127.0.0.1:{host_port}") }]
-        }],
+        "match": [{ "host": hosts }],
+        "handle": [handle],
         "terminal": true
     })
 }
@@ -56,9 +101,14 @@ fn initial_config() -> Value {
 
 /// Crea o sustituye la ruta de la app. PATCH sobre `/id/...` reemplaza la
 /// ruta existente en sitio; si no existe aún, se añade al final.
-pub async fn upsert_route(app_id: &str, domain: &str, host_port: u16) -> Result<(), String> {
+pub async fn upsert_route(
+    app_id: &str,
+    domain: &str,
+    aliases: &[Alias],
+    host_port: u16,
+) -> Result<(), String> {
     let client = local_http(Duration::from_secs(10))?;
-    let body = route_json(app_id, domain, host_port).to_string();
+    let body = route_json(app_id, domain, aliases, host_port).to_string();
 
     let patched = client
         .patch(format!("{ADMIN}/id/{}", route_id(app_id)))
@@ -258,12 +308,46 @@ mod tests {
         let r = route_json(
             "11111111-2222-3333-4444-555555555555",
             "app.ejemplo.com",
+            &[],
             20001,
         );
         assert_eq!(r["@id"], "sbapp-11111111-2222-3333-4444-555555555555");
         assert_eq!(r["match"][0]["host"][0], "app.ejemplo.com");
         assert_eq!(r["handle"][0]["handler"], "reverse_proxy");
         assert_eq!(r["handle"][0]["upstreams"][0]["dial"], "127.0.0.1:20001");
+    }
+
+    #[test]
+    fn route_json_with_aliases() {
+        let aliases = [
+            Alias {
+                domain: "www.ejemplo.com".into(),
+                redirect: true,
+            },
+            Alias {
+                domain: "otro.com".into(),
+                redirect: false,
+            },
+        ];
+        let r = route_json("x", "ejemplo.com", &aliases, 20001);
+        assert_eq!(
+            r["match"][0]["host"],
+            json!(["ejemplo.com", "www.ejemplo.com", "otro.com"])
+        );
+        let routes = &r["handle"][0]["routes"];
+        assert_eq!(routes[0]["match"][0]["host"], json!(["www.ejemplo.com"]));
+        assert_eq!(routes[0]["handle"][0]["status_code"], 308);
+        assert_eq!(
+            routes[0]["handle"][0]["headers"]["Location"][0],
+            "https://ejemplo.com{http.request.uri}"
+        );
+        assert_eq!(
+            routes[1]["handle"][0]["upstreams"][0]["dial"],
+            "127.0.0.1:20001"
+        );
+        // Solo alias que sirven la app: sin subruta.
+        let r = route_json("x", "ejemplo.com", &aliases[1..], 20001);
+        assert_eq!(r["handle"][0]["handler"], "reverse_proxy");
     }
 
     #[test]
