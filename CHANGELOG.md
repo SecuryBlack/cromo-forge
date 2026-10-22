@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-22
+
+### Added
+- **Containers**: `docker_get_logs` with `structured: true` returns `lines` (time, `stdout`/`stderr`, container) and `last_ts`. With `since` it drops the lines at that exact time, so the panel can ask only for what is new.
+- **Containers**: `docker_get_logs` accepts `container_ids` (up to 20) and merges their logs by time, for a whole Compose project or app.
+- **Containers**: `docker_container_stats` command — a `docker stats` snapshot of the running containers (CPU, memory, network, disk I/O, PIDs).
+- **Containers**: `docker_list_containers` adds `compose_project`, `compose_service` and `sb_app` from the container labels.
+
+### Fixed
+- **Containers**: `docker_get_logs` without timestamps put all stderr after all stdout; lines are now always ordered by time. Sub-second times are compared numerically (Docker trims trailing zeros).
+
 ## [0.3.0] - 2026-10-20
 
 ### Added
