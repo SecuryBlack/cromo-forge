@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-22
+
+### Fixed
+- **Deployments**: Two web apps deploying at the same time on one server could pick the same free host port; the second one failed with "port is already allocated". Picking the port and `docker run` now happen under one lock.
+
 ## [0.5.0] - 2026-10-22
 
 ### Added
