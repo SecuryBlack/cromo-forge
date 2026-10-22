@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-22
+
+### Added
+- **Deployments**: `deploy_app` takes `app.builder`: `railpack` (default, as before), `dockerfile` (built with BuildKit's `dockerfile.v0` inside `sb-buildkit`, same limits and cache) or `auto` (the Dockerfile if there is one, otherwise Railpack). `app.dockerfile_path` defaults to `Dockerfile`.
+- **Deployments**: `app.root_dir` builds from a folder of the repo (monorepos). Paths are checked to stay inside the repo.
+- **Deployments**: `app.install_command`, `app.build_command` and `app.start_command` override what Railpack detects; `start_command` also works with a Dockerfile.
+- **Install**: `install.sh` installs Docker when it is missing (`--no-docker` skips it).
 
 ### Fixed
 - **Deployments**: App and cron containers no longer grow their logs forever. With Docker's default `json-file` driver they are capped at 3 files of 10 MB; other drivers are left as configured. Applies to containers started from now on (next deploy).
