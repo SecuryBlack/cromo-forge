@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-10-22
 
 ### Added
 - **Containers**: `docker_get_logs` with `structured: true` returns `lines` (time, `stdout`/`stderr`, container) and `last_ts`. With `since` it drops the lines at that exact time, so the panel can ask only for what is new.
