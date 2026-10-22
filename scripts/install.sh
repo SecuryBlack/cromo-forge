@@ -2,8 +2,8 @@
 # CromoForge — Install script
 # Usage: curl -fsSL https://install.cromoforge.dev | bash -s -- --token <TOKEN>
 #
-# Prerequisite for git deployments: Docker Engine with the buildx plugin.
-# This script does not install Docker; it only warns if it is missing.
+# Git deployments need Docker Engine with the buildx plugin. If Docker is
+# missing it is installed (--no-docker to skip).
 set -euo pipefail
 
 SB_AGENT_LABEL="cromoforge"
@@ -27,11 +27,13 @@ RAILPACK_RELEASES="https://github.com/railwayapp/railpack/releases/download/${RA
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 TOKEN=""
 SOURCE="local"
+INSTALL_DOCKER=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --token)  TOKEN="$2";  shift 2 ;;
     --source) SOURCE="$2"; shift 2 ;;
+    --no-docker) INSTALL_DOCKER=false; shift ;;
     *) sb_die "Unknown argument: $1" ;;
   esac
 done
@@ -75,8 +77,29 @@ grep -E "^[0-9a-f]{64}  ${RAILPACK_ASSET}\$" "${RAILPACK_DIR}/checksums.txt" > "
 sb_success "Railpack checksum OK"
 sb_install_binary "${RAILPACK_DIR}/${RAILPACK_ASSET}" "railpack" "$INSTALL_DIR"
 
+# ─── Docker ───────────────────────────────────────────────────────────────────
+# apt's own packages first: get.docker.com lags new Ubuntu releases and, when it
+# fails there, leaves a broken apt source behind. It covers everything else.
+install_docker() {
+  local log="/tmp/cromoforge-docker.log"
+  sb_info "Installing Docker…"
+  if command -v apt-get &>/dev/null \
+    && DEBIAN_FRONTEND=noninteractive apt-get update -qq >"$log" 2>&1 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io docker-buildx >>"$log" 2>&1; then
+    :
+  elif ! curl -fsSL https://get.docker.com | sh >>"$log" 2>&1; then
+    sb_die "Docker install failed (see ${log}). Install Docker Engine with buildx and run this again, or pass --no-docker."
+  fi
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  sb_success "$(docker --version)"
+}
+
 if ! command -v docker &>/dev/null; then
-  sb_warn "Docker not found. Git deployments need Docker Engine with the buildx plugin."
+  if $INSTALL_DOCKER; then
+    install_docker
+  else
+    sb_warn "Docker not found. Git deployments need Docker Engine with the buildx plugin."
+  fi
 elif ! docker buildx version &>/dev/null; then
   sb_warn "Docker buildx plugin not found. Git deployments need it."
 fi
