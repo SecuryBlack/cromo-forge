@@ -107,6 +107,21 @@ struct Source {
     token: String,
 }
 
+/// Contenedor auxiliar de la app (la base de datos de una plantilla). Va en
+/// la red `sbapp-<app>` y la app lo encuentra por `name`. Sin `Debug`: `env`
+/// son secretos.
+#[derive(Deserialize, Serialize)]
+struct Sidecar {
+    name: String,
+    image: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    volumes: Vec<String>,
+    #[serde(default)]
+    command: Option<String>,
+}
+
 /// Sin `Debug` a propósito: `source.token`, `env` y `build_env` son secretos.
 #[derive(Deserialize)]
 struct DeployRequest {
@@ -116,6 +131,11 @@ struct DeployRequest {
     source: Option<Source>,
     #[serde(default)]
     image: Option<String>,
+    /// Imagen de un registro (plantillas): se descarga y no se construye nada.
+    #[serde(default)]
+    registry_image: Option<String>,
+    #[serde(default)]
+    sidecars: Vec<Sidecar>,
     #[serde(default)]
     build_env: BTreeMap<String, String>,
     #[serde(default)]
@@ -240,8 +260,13 @@ fn volume_name(app_id: &str, path: &str) -> String {
 }
 
 /// Un `--mount` por volumen. La etiqueta `sb.app` (solo se pone al crearlo)
-/// es la que usa `remove_app` para encontrarlos.
-fn volume_args(app_id: &str, volumes: &[String]) -> Vec<String> {
+/// es la que usa `remove_app` para encontrarlos. Los de un auxiliar llevan su
+/// nombre delante de la ruta: `sbapp-<app>-db-var_lib_data`.
+fn volume_args(app_id: &str, sidecar: Option<&str>, volumes: &[String]) -> Vec<String> {
+    let owner = match sidecar {
+        Some(name) => format!("{app_id}-{name}"),
+        None => app_id.to_string(),
+    };
     volumes
         .iter()
         .flat_map(|path| {
@@ -249,11 +274,47 @@ fn volume_args(app_id: &str, volumes: &[String]) -> Vec<String> {
                 "--mount".to_string(),
                 format!(
                     "type=volume,source={},target={path},volume-label=sb.app={app_id}",
-                    volume_name(app_id, path)
+                    volume_name(&owner, path)
                 ),
             ]
         })
         .collect()
+}
+
+fn check_volumes(owner: &str, volumes: &[String]) -> Result<(), String> {
+    if volumes.len() > 5 {
+        return Err("at most 5 volumes".into());
+    }
+    let mut names = std::collections::HashSet::new();
+    for v in volumes {
+        if !is_volume_path(v) || !names.insert(volume_name(owner, v)) {
+            return Err(format!("invalid volume: {v}"));
+        }
+    }
+    Ok(())
+}
+
+/// Imagen de un registro: `postgres:16-alpine`, `ghcr.io/org/app:3`. Las
+/// `sbapp/` son las que construye CromoForge y solo entran por `image`.
+fn is_image_ref(s: &str) -> bool {
+    (1..=255).contains(&s.len())
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "./_:@-".contains(c))
+        && !s.starts_with("sbapp/")
+}
+
+fn check_env(env: &BTreeMap<String, String>) -> Result<(), String> {
+    for (k, v) in env {
+        if !is_env_key(k) {
+            return Err(format!("invalid env key: {k}"));
+        }
+        // `--env-file` es una línea por variable, sin escapes posibles.
+        if v.contains(['\0', '\n', '\r']) {
+            return Err(format!("invalid env value for {k}"));
+        }
+    }
+    Ok(())
 }
 
 /// Comandos a medida: una línea de como mucho 1000 caracteres.
@@ -323,15 +384,7 @@ impl DeployRequest {
         if !is_rel_path(&app.dockerfile_path) {
             return Err("invalid app.dockerfile_path".into());
         }
-        if app.volumes.len() > 5 {
-            return Err("at most 5 volumes".into());
-        }
-        let mut names = std::collections::HashSet::new();
-        for v in &app.volumes {
-            if !is_volume_path(v) || !names.insert(volume_name(&app.id, v)) {
-                return Err(format!("invalid app.volumes: {v}"));
-            }
-        }
+        check_volumes(&app.id, &app.volumes).map_err(|e| format!("app.volumes: {e}"))?;
         if app.kind == AppKind::Cron {
             let schedule = app
                 .schedule
@@ -359,7 +412,36 @@ impl DeployRequest {
                     return Err("invalid image".into());
                 }
             }
-            _ => return Err("exactly one of source or image is required".into()),
+            (None, None) => {
+                if !self.registry_image.as_deref().is_some_and(is_image_ref) {
+                    return Err("invalid registry_image".into());
+                }
+            }
+            _ => return Err("exactly one of source, image or registry_image is required".into()),
+        }
+        if self.registry_image.is_some() && (self.source.is_some() || self.image.is_some()) {
+            return Err("exactly one of source, image or registry_image is required".into());
+        }
+        if !self.sidecars.is_empty() && app.kind == AppKind::Cron {
+            return Err("cron apps cannot have sidecars".into());
+        }
+        if self.sidecars.len() > 5 {
+            return Err("at most 5 sidecars".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for sc in &self.sidecars {
+            if !is_app_name(&sc.name) || sc.name.len() > 20 || !seen.insert(&sc.name) {
+                return Err(format!("invalid sidecar name: {}", sc.name));
+            }
+            if !is_image_ref(&sc.image) {
+                return Err(format!("invalid image for sidecar {}", sc.name));
+            }
+            if sc.command.as_deref().is_some_and(|c| !is_command(c)) {
+                return Err(format!("invalid command for sidecar {}", sc.name));
+            }
+            check_volumes(&format!("{}-{}", app.id, sc.name), &sc.volumes)
+                .and_then(|_| check_env(&sc.env))
+                .map_err(|e| format!("sidecar {}: {e}", sc.name))?;
         }
         for (k, v) in self.env.iter().chain(&self.build_env) {
             if !is_env_key(k) {
@@ -996,7 +1078,10 @@ async fn start_container(
         args.push("-e".into());
         args.push(format!("PORT={}", app.port));
     }
-    args.extend(volume_args(&app.id, &app.volumes));
+    if !req.sidecars.is_empty() {
+        args.extend(["--network".into(), app_network(&app.id)]);
+    }
+    args.extend(volume_args(&app.id, None, &app.volumes));
     args.extend(image_and_command(image, app.start_command.as_deref()));
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
@@ -1119,6 +1204,124 @@ async fn container_names(app_id: &str) -> Result<Vec<String>, String> {
         ])
         .await?,
     ))
+}
+
+fn app_network(app_id: &str) -> String {
+    format!("sbapp-{app_id}")
+}
+
+fn sidecar_container(app_id: &str, name: &str) -> String {
+    format!("sbapp-{app_id}-svc-{name}")
+}
+
+/// FNV-1a: estable entre versiones de Rust, a diferencia de `DefaultHasher`.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Deja los auxiliares como dice el payload: arranca los que faltan, recrea
+/// los que cambian de especificación o de imagen y quita los que sobran. Los
+/// que no cambian siguen en marcha (la base de datos no se reinicia en cada
+/// despliegue).
+async fn sync_sidecars(req: &DeployRequest, p: &Progress) -> Result<(), String> {
+    let app_id = &req.app.id;
+    let net = app_network(app_id);
+    let wanted: Vec<String> = req
+        .sidecars
+        .iter()
+        .map(|s| sidecar_container(app_id, &s.name))
+        .collect();
+    let stale: Vec<String> = lines(
+        &docker([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=sb.sidecar={app_id}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .await?,
+    )
+    .into_iter()
+    .filter(|c| !wanted.contains(c))
+    .collect();
+    if !stale.is_empty() {
+        docker(["rm", "-f"].into_iter().map(String::from).chain(stale)).await?;
+    }
+    if req.sidecars.is_empty() {
+        return Ok(());
+    }
+    if docker(["network", "inspect", &net]).await.is_err() {
+        docker([
+            "network",
+            "create",
+            "--label",
+            &format!("sb.app={app_id}"),
+            &net,
+        ])
+        .await?;
+    }
+    for (sc, name) in req.sidecars.iter().zip(&wanted) {
+        if let Err(e) = docker(["pull", "-q", &sc.image]).await {
+            p.log(&format!(
+                "{}: pull failed, using the local image: {e}",
+                sc.name
+            ));
+        }
+        let image_id = docker(["image", "inspect", "-f", "{{.Id}}", &sc.image]).await?;
+        let spec = format!(
+            "{:016x}",
+            fnv1a(&serde_json::to_string(sc).map_err(|e| e.to_string())?)
+        );
+        let current = docker([
+            "inspect",
+            "-f",
+            "{{.Image}} {{index .Config.Labels \"sb.spec\"}} {{.State.Running}}",
+            name,
+        ])
+        .await
+        .unwrap_or_default();
+        if current == format!("{image_id} {spec} true") {
+            continue;
+        }
+        p.log(&format!("Starting {}", sc.name));
+        let _ = docker(["rm", "-f", name]).await;
+        let mut args: Vec<String> = [
+            "run",
+            "-d",
+            "--pull",
+            "never",
+            "--name",
+            name,
+            "--restart",
+            "unless-stopped",
+            "--network",
+            &net,
+            "--network-alias",
+            &sc.name,
+        ]
+        .map(String::from)
+        .into();
+        args.extend([
+            "--label".into(),
+            format!("sb.sidecar={app_id}"),
+            "--label".into(),
+            format!("sb.spec={spec}"),
+        ]);
+        args.extend(log_rotation().await);
+        let env_dir = WorkDir::new("env", name)?;
+        let env_file = env_dir.0.join("app.env");
+        write_private(&env_file, &env_file_content(&sc.env, false))?;
+        args.extend(["--env-file".into(), env_file.to_string_lossy().into_owned()]);
+        args.extend(volume_args(app_id, Some(&sc.name), &sc.volumes));
+        args.extend(image_and_command(&sc.image, sc.command.as_deref()));
+        let result = docker(args).await;
+        drop(env_dir);
+        result.map_err(|e| format!("{}: {e}", sc.name))?;
+    }
+    Ok(())
 }
 
 /// Para los contenedores en marcha de la app y devuelve sus nombres.
@@ -1375,7 +1578,7 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
     .into();
     args.extend(log_rotation().await);
     args.extend([String::from("--env-file"), env_path]);
-    args.extend(volume_args(app_id, &job.volumes));
+    args.extend(volume_args(app_id, None, &job.volumes));
     args.extend(image_and_command(&job.image, job.start_command.as_deref()));
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
@@ -1448,6 +1651,9 @@ async fn run_deploy(
 ) -> Result<(String, Option<String>, Option<u16>), StageError> {
     let app = &req.app;
 
+    // Con una imagen de registro de etiqueta móvil (`:3`), la versión que se
+    // sustituye se borra al terminar.
+    let mut replaced_image = None;
     let image = match (&req.source, &req.image) {
         (Some(src), _) => {
             p.stage("fetch", "Downloading source code");
@@ -1476,7 +1682,17 @@ async fn run_deploy(
             image
         }
         (None, Some(image)) => image.clone(),
-        (None, None) => unreachable!("validated"),
+        (None, None) => {
+            let image = req.registry_image.clone().expect("validated");
+            p.stage("fetch", "Pulling image");
+            replaced_image = docker(["image", "inspect", "-f", "{{.Id}}", &image])
+                .await
+                .ok();
+            if let Err(e) = docker(["pull", "-q", &image]).await {
+                p.log(&format!("Pull failed, using the local image: {e}"));
+            }
+            image
+        }
     };
 
     p.stage("start", "Starting container");
@@ -1507,6 +1723,7 @@ async fn run_deploy(
         }
         return Ok((image, None, None));
     }
+    sync_sidecars(req, p).await.map_err(at("start"))?;
     // Con volúmenes, dos versiones a la vez escribirían en los mismos datos (una
     // base de datos se corrompe): se para la anterior antes de arrancar la nueva
     // y, si la nueva falla, se vuelve a arrancar. Son unos segundos sin servicio.
@@ -1594,6 +1811,16 @@ async fn run_deploy(
     if let Err(e) = cleanup(&app.id, &container, &image, req.keep_images, p).await {
         p.log(&format!("cleanup: {e}"));
     }
+    if let Some(old) = replaced_image {
+        // Falla (y no pasa nada) si no cambió o si otra app la usa.
+        if docker(["image", "inspect", "-f", "{{.Id}}", &image])
+            .await
+            .ok()
+            != Some(old.clone())
+        {
+            let _ = docker(["rmi", &old]).await;
+        }
+    }
 
     Ok((image, Some(container), host_port))
 }
@@ -1621,7 +1848,18 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
             }
             _ => {}
         }
-        let containers = container_names(&req.app_id).await?;
+        let mut containers = container_names(&req.app_id).await?;
+        containers.extend(lines(
+            &docker([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("label=sb.sidecar={}", req.app_id),
+                "--format",
+                "{{.Names}}",
+            ])
+            .await?,
+        ));
         if !containers.is_empty() {
             docker(
                 ["rm", "-f"]
@@ -1683,6 +1921,7 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
             )
             .await?;
         }
+        let _ = docker(["network", "rm", &app_network(&req.app_id)]).await;
         Ok::<_, String>(json!({
             "app_id": req.app_id,
             "containers_removed": containers.len(),
@@ -1859,7 +2098,7 @@ mod tests {
         v["app"]["volumes"] = json!(["/var/lib/postgresql/data", "/app/uploads"]);
         let r = validate(v.clone()).unwrap();
         assert_eq!(
-            volume_args(APP_ID, &r.app.volumes),
+            volume_args(APP_ID, None, &r.app.volumes),
             [
                 "--mount".to_string(),
                 format!("type=volume,source=sbapp-{APP_ID}-var_lib_postgresql_data,target=/var/lib/postgresql/data,volume-label=sb.app={APP_ID}"),
@@ -1884,6 +2123,59 @@ mod tests {
             w["app"]["volumes"] = bad.clone();
             assert!(validate(w).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn registry_images_and_sidecars_are_validated() {
+        let mut v = payload();
+        v["source"] = Value::Null;
+        v["registry_image"] = json!("ghcr.io/umami-software/umami:3");
+        v["app"]["volumes"] = json!(["/app/data"]);
+        v["sidecars"] = json!([{
+            "name": "db",
+            "image": "postgres:16-alpine",
+            "env": { "POSTGRES_PASSWORD": "x" },
+            "volumes": ["/var/lib/postgresql/data"],
+            "command": null
+        }]);
+        let r = validate(v.clone()).unwrap();
+        assert_eq!(
+            volume_args(APP_ID, Some("db"), &r.sidecars[0].volumes)[1],
+            format!("type=volume,source=sbapp-{APP_ID}-db-var_lib_postgresql_data,target=/var/lib/postgresql/data,volume-label=sb.app={APP_ID}")
+        );
+        assert_eq!(
+            sidecar_container(APP_ID, "db"),
+            format!("sbapp-{APP_ID}-svc-db")
+        );
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
+
+        let cases: Vec<(&str, Value)> = vec![
+            ("/registry_image", json!("sbapp/x:1")),
+            ("/registry_image", json!("-x")),
+            ("/registry_image", json!("a b")),
+            ("/sidecars/0/name", json!("DB")),
+            ("/sidecars/0/name", json!("x".repeat(21))),
+            ("/sidecars/0/image", json!("")),
+            ("/sidecars/0/env", json!({ "K": "a\nb" })),
+            ("/sidecars/0/volumes", json!(["data"])),
+            ("/sidecars/0/command", json!("")),
+        ];
+        for (ptr, bad) in cases {
+            let mut w = v.clone();
+            *w.pointer_mut(ptr).unwrap() = bad.clone();
+            assert!(validate(w).is_err(), "{ptr} = {bad} should be rejected");
+        }
+        let mut w = v.clone();
+        let first = w["sidecars"][0].clone();
+        w["sidecars"].as_array_mut().unwrap().push(first);
+        assert!(validate(w).is_err(), "nombre repetido");
+        let mut w = v.clone();
+        w["source"] = payload()["source"].clone();
+        assert!(validate(w).is_err(), "source y registry_image");
+        let mut w = v;
+        w["app"]["type"] = json!("cron");
+        w["app"]["schedule"] = json!("* * * * *");
+        assert!(validate(w).is_err(), "cron con auxiliares");
     }
 
     #[test]
