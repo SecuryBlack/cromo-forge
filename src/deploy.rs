@@ -689,6 +689,7 @@ async fn start_container(
         "--label".into(),
         format!("sb.deployment={}", req.deployment_id),
     ];
+    args.extend(log_rotation().await);
     // `env` va por un fichero 0600 que se borra al volver `docker run`: ni en
     // la lista de procesos (argv) ni en el entorno del propio CLI de Docker
     // (donde una app podría colar LD_PRELOAD o DOCKER_HOST).
@@ -707,6 +708,27 @@ async fn start_container(
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
     result
+}
+
+/// Con `json-file`, el driver que trae Docker por defecto, los logs de un
+/// contenedor no se rotan nunca y acaban llenando el disco: se limitan a 3
+/// ficheros de 10 MB. Los demás drivers no aceptan estas opciones (con
+/// `journald` fallaría `docker run`) y ya rotan o los ha elegido el dueño del
+/// servidor, así que se dejan como están.
+fn log_rotation_args(driver: &str) -> Vec<String> {
+    if driver.trim() != "json-file" {
+        return Vec::new();
+    }
+    ["--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
+        .map(String::from)
+        .into()
+}
+
+async fn log_rotation() -> Vec<String> {
+    let driver = docker(["info", "--format", "{{.LoggingDriver}}"])
+        .await
+        .unwrap_or_default();
+    log_rotation_args(&driver)
 }
 
 /// Contenido de `--env-file`: `K=V` por línea, literal (Docker no interpreta
@@ -1027,21 +1049,14 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
     write_private(&env_file, &env_file_content(&job.env, false))?;
     let env_path = env_file.to_string_lossy().into_owned();
     let label = format!("sb.app={app_id}");
-    let result = docker([
-        "run",
-        "-d",
-        "--pull",
-        "never",
-        "--name",
-        &name,
-        "--label",
-        &label,
-        "--env-file",
-        &env_path,
-        &job.image,
-    ])
-    .await
-    .map(|_| ());
+    let mut args: Vec<String> = [
+        "run", "-d", "--pull", "never", "--name", &name, "--label", &label,
+    ]
+    .map(String::from)
+    .into();
+    args.extend(log_rotation().await);
+    args.extend([String::from("--env-file"), env_path, job.image.clone()]);
+    let result = docker(args).await.map(|_| ());
     drop(env_dir);
     if result.is_ok() {
         tracing::info!(app_id, "cron run started");
@@ -1303,6 +1318,20 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_rotation_only_for_json_file() {
+        assert_eq!(
+            super::log_rotation_args(
+                "json-file
+"
+            ),
+            ["--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
+        );
+        assert!(super::log_rotation_args("journald").is_empty());
+        assert!(super::log_rotation_args("local").is_empty());
+        assert!(super::log_rotation_args("").is_empty());
+    }
+
     use super::*;
 
     const APP_ID: &str = "0b7c5a52-6a7e-4b8e-9d0b-3f2a1c4d5e6f";
