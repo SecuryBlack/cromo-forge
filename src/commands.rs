@@ -12,6 +12,13 @@ pub struct DockerContainer {
     pub status: String,
     pub ports: String,
     pub created_at: String,
+    /// Proyecto y servicio de Docker Compose, o la app de SB: el panel agrupa por ellos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sb_app: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +32,17 @@ struct DockerPsEntry {
     status: Option<String>,
     ports: Option<String>,
     created_at: Option<String>,
+    labels: Option<String>,
+}
+
+/// `docker ps` da las etiquetas como `k=v,k=v`. Un valor con comas (los `config_files` de
+/// Compose) se parte, pero las tres que leemos nunca las llevan.
+fn label(labels: &str, key: &str) -> Option<String> {
+    labels
+        .split(',')
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +84,12 @@ pub fn register(registry: &CommandRegistry) {
 
     registry.register("docker_get_logs", |payload, _progress| async move {
         tokio::task::spawn_blocking(move || get_container_logs(payload))
+            .await
+            .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
+    });
+
+    registry.register("docker_container_stats", |_payload, _progress| async move {
+        tokio::task::spawn_blocking(container_stats)
             .await
             .unwrap_or_else(|e| CommandOutcome::failed(format!("task panicked: {e}")))
     });
@@ -170,7 +194,11 @@ fn list_containers() -> CommandOutcome {
         }
 
         if let Ok(entry) = serde_json::from_str::<DockerPsEntry>(trimmed) {
+            let labels = entry.labels.unwrap_or_default();
             containers.push(DockerContainer {
+                compose_project: label(&labels, "com.docker.compose.project"),
+                compose_service: label(&labels, "com.docker.compose.service"),
+                sb_app: label(&labels, "sb.app"),
                 id: entry.id.unwrap_or_default(),
                 name: entry.names.unwrap_or_default(),
                 image: entry.image.unwrap_or_default(),
@@ -201,14 +229,25 @@ struct ContainerActionPayload {
 
 #[derive(Debug, Deserialize)]
 struct GetLogsPayload {
+    #[serde(default)]
     container_id: String,
+    /// Vista conjunta: los logs de varios contenedores, mezclados por hora.
+    #[serde(default)]
+    container_ids: Vec<String>,
     #[serde(default = "default_tail")]
     tail: u32,
     #[serde(default = "default_true")]
     timestamps: bool,
+    /// Inclusivo, como `docker logs --since`. En modo `structured` se quitan las líneas
+    /// con esa misma hora: son las que el panel ya tiene.
     #[serde(default)]
     since: Option<String>,
+    /// `lines` con hora, stdout/stderr y contenedor, en vez de un texto.
+    #[serde(default)]
+    structured: bool,
 }
+
+const MAX_MERGED_CONTAINERS: usize = 20;
 
 fn default_tail() -> u32 {
     200
@@ -341,68 +380,201 @@ fn get_container_logs(payload: serde_json::Value) -> CommandOutcome {
         Err(e) => return CommandOutcome::failed(format!("invalid payload: {e}")),
     };
 
-    if !is_safe_container_id(&args.container_id) {
+    let ids = if args.container_ids.is_empty() {
+        vec![args.container_id.clone()]
+    } else {
+        args.container_ids.clone()
+    };
+    if ids.len() > MAX_MERGED_CONTAINERS || !ids.iter().all(|id| is_safe_container_id(id)) {
         return CommandOutcome::failed("invalid container_id");
     }
 
-    let tail_str = args.tail.clamp(1, 2000).to_string();
-    let mut cmd = Command::new("docker");
-    cmd.args(["logs", "--tail", &tail_str]);
-    if args.timestamps {
-        cmd.arg("--timestamps");
-    }
-    if let Some(ref since) = args.since {
-        if is_safe_since(since) {
+    let tail = args.tail.clamp(1, 2000);
+    let since = args.since.as_deref().filter(|s| is_safe_since(s));
+    let mut batches = Vec::with_capacity(ids.len());
+    for id in &ids {
+        // Siempre con hora: es lo que permite intercalar stdout, stderr y contenedores.
+        let mut cmd = Command::new("docker");
+        cmd.args(["logs", "--timestamps", "--tail", &tail.to_string()]);
+        if let Some(since) = since {
             cmd.args(["--since", since]);
         }
-    }
-    cmd.arg(&args.container_id);
-
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => return CommandOutcome::failed(format!("failed to execute docker logs: {e}")),
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return CommandOutcome::failed(format!("docker logs failed: {stderr}"));
-    }
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-
-    let combined_logs = if args.timestamps {
-        let mut lines: Vec<&str> = stdout_str
-            .lines()
-            .chain(stderr_str.lines())
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        lines.sort();
-        lines.join("\n")
-    } else {
-        let mut res = String::with_capacity(stdout_str.len() + stderr_str.len());
-        res.push_str(&stdout_str);
-        if !stderr_str.is_empty() {
-            if !res.is_empty() && !res.ends_with('\n') {
-                res.push('\n');
-            }
-            res.push_str(&stderr_str);
+        let output = match cmd.arg(id).output() {
+            Ok(o) => o,
+            Err(e) => return CommandOutcome::failed(format!("failed to execute docker logs: {e}")),
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return CommandOutcome::failed(format!("docker logs failed: {stderr}"));
         }
-        res
-    };
+        batches.push(parse_docker_logs(
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            id,
+        ));
+    }
 
-    let total_lines = combined_logs.lines().count();
+    let lines = merge_log_lines(batches, since.filter(|_| args.structured), tail as usize);
+
+    if args.structured {
+        let last_ts = lines.last().map(|l| l.ts.as_str()).or(since).unwrap_or("");
+        return CommandOutcome::ok(
+            json!({
+                "total_lines": lines.len(),
+                "last_ts": last_ts,
+                "lines": lines.iter().map(|l| json!({
+                    "ts": l.ts,
+                    "stream": l.stream,
+                    "container": l.container,
+                    "text": l.text,
+                })).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        );
+    }
+
+    let combined_logs = lines
+        .iter()
+        .map(|l| {
+            if args.timestamps && !l.ts.is_empty() {
+                format!("{} {}", l.ts, l.text)
+            } else {
+                l.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     CommandOutcome::ok(
         json!({
             "container_id": args.container_id,
             "tail": args.tail,
             "timestamps": args.timestamps,
-            "total_lines": total_lines,
+            "total_lines": lines.len(),
             "logs": combined_logs
         })
         .to_string(),
     )
+}
+
+#[derive(Debug)]
+struct LogLine {
+    ts: String,
+    /// `ts` con la fracción a 9 dígitos: Docker los recorta y `.5Z` ordenaría tras `.45Z`.
+    key: String,
+    stream: &'static str,
+    container: String,
+    text: String,
+}
+
+fn parse_docker_logs(stdout: &str, stderr: &str, container: &str) -> Vec<LogLine> {
+    let tag = |out: &str, stream: &'static str| -> Vec<LogLine> {
+        out.lines()
+            .map(|raw| {
+                let raw = raw.strip_suffix('\r').unwrap_or(raw);
+                let (ts, text) = match raw.split_once(' ') {
+                    Some((ts, text)) if looks_like_ts(ts) => (ts, text),
+                    _ if looks_like_ts(raw) => (raw, ""),
+                    _ => ("", raw),
+                };
+                LogLine {
+                    ts: ts.to_string(),
+                    key: ts_key(ts),
+                    stream,
+                    container: container.to_string(),
+                    text: text.to_string(),
+                }
+            })
+            .collect()
+    };
+    let mut lines = tag(stdout, "stdout");
+    lines.extend(tag(stderr, "stderr"));
+    lines
+}
+
+fn looks_like_ts(s: &str) -> bool {
+    s.len() >= 20 && s.as_bytes()[4] == b'-' && s.as_bytes()[10] == b'T' && s.ends_with('Z')
+}
+
+fn ts_key(ts: &str) -> String {
+    let Some(body) = ts.strip_suffix('Z') else {
+        return ts.to_string();
+    };
+    let (secs, frac) = body.split_once('.').unwrap_or((body, ""));
+    format!("{secs}.{frac:0<9}Z")
+}
+
+/// Ordena por hora (estable: a igual hora se respeta el orden de Docker), quita lo que el
+/// panel ya tiene (`since`) y se queda con las `tail` últimas.
+fn merge_log_lines(batches: Vec<Vec<LogLine>>, since: Option<&str>, tail: usize) -> Vec<LogLine> {
+    let mut lines: Vec<LogLine> = batches.into_iter().flatten().collect();
+    if let Some(since) = since {
+        lines.retain(|l| l.ts != since);
+    }
+    lines.sort_by(|a, b| a.key.cmp(&b.key));
+    let skip = lines.len().saturating_sub(tail);
+    lines.drain(..skip);
+    lines
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerStatsEntry {
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "CPUPerc")]
+    cpu_perc: Option<String>,
+    #[serde(rename = "MemPerc")]
+    mem_perc: Option<String>,
+    #[serde(rename = "MemUsage")]
+    mem_usage: Option<String>,
+    #[serde(rename = "NetIO")]
+    net_io: Option<String>,
+    #[serde(rename = "BlockIO")]
+    block_io: Option<String>,
+    #[serde(rename = "PIDs")]
+    pids: Option<String>,
+}
+
+/// `12.34%` → 12.34; `--` (contenedor parado) → None.
+fn percent(s: &Option<String>) -> Option<f64> {
+    s.as_deref()?.trim().trim_end_matches('%').parse().ok()
+}
+
+/// Una foto de `docker stats` de los contenedores en marcha. Tarda un par de segundos,
+/// que es lo que Docker necesita para calcular la CPU.
+fn container_stats() -> CommandOutcome {
+    let output = match Command::new("docker")
+        .args(["stats", "--no-stream", "--format", "{{json .}}"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return CommandOutcome::failed(format!("failed to execute docker stats: {e}")),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return CommandOutcome::failed(format!("docker stats failed: {stderr}"));
+    }
+
+    let containers: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<DockerStatsEntry>(l.trim()).ok())
+        .map(|e| {
+            json!({
+                "id": e.id.clone().unwrap_or_default(),
+                "name": e.name.clone().unwrap_or_default(),
+                "cpu_percent": percent(&e.cpu_perc),
+                "mem_percent": percent(&e.mem_perc),
+                "mem_usage": e.mem_usage.unwrap_or_default(),
+                "net_io": e.net_io.unwrap_or_default(),
+                "block_io": e.block_io.unwrap_or_default(),
+                "pids": e.pids.and_then(|p| p.parse::<u32>().ok()),
+            })
+        })
+        .collect();
+
+    CommandOutcome::ok(json!({ "containers": containers }).to_string())
 }
 
 mod update_now {
@@ -782,5 +954,88 @@ fn postgres_action(payload: serde_json::Value) -> CommandOutcome {
             }
         }
         other => CommandOutcome::failed(format!("Unsupported action: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_compose_and_sb_labels() {
+        let labels = "com.docker.compose.project=monitor,com.docker.compose.project.config_files=/a.yml,/b.yml,com.docker.compose.service=dozzle,sb.app=42";
+        assert_eq!(
+            label(labels, "com.docker.compose.project").as_deref(),
+            Some("monitor")
+        );
+        assert_eq!(
+            label(labels, "com.docker.compose.service").as_deref(),
+            Some("dozzle")
+        );
+        assert_eq!(label(labels, "sb.app").as_deref(), Some("42"));
+        assert_eq!(label(labels, "sb.deployment"), None);
+        assert_eq!(label("", "sb.app"), None);
+    }
+
+    #[test]
+    fn fraction_is_padded_so_order_is_numeric() {
+        assert!(ts_key("2026-10-22T10:00:00.45Z") < ts_key("2026-10-22T10:00:00.5Z"));
+        assert!(ts_key("2026-10-22T10:00:00Z") < ts_key("2026-10-22T10:00:00.000000001Z"));
+    }
+
+    #[test]
+    fn interleaves_streams_and_containers_by_time() {
+        let a = parse_docker_logs(
+            "2026-10-22T10:00:00.1Z out 1\n2026-10-22T10:00:00.3Z out 2\r\n",
+            "2026-10-22T10:00:00.25Z err 1\n",
+            "api",
+        );
+        let b = parse_docker_logs("2026-10-22T10:00:00.2Z worker 1\n", "", "worker");
+        let merged = merge_log_lines(vec![a, b], None, 100);
+        let got: Vec<_> = merged
+            .iter()
+            .map(|l| (l.container.as_str(), l.stream, l.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("api", "stdout", "out 1"),
+                ("worker", "stdout", "worker 1"),
+                ("api", "stderr", "err 1"),
+                ("api", "stdout", "out 2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_lines_already_seen_and_keeps_the_tail() {
+        let lines = parse_docker_logs(
+            "2026-10-22T10:00:01Z seen\n2026-10-22T10:00:02Z new 1\n2026-10-22T10:00:03Z new 2\n",
+            "",
+            "api",
+        );
+        let merged = merge_log_lines(vec![lines], Some("2026-10-22T10:00:01Z"), 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "new 2");
+    }
+
+    #[test]
+    fn keeps_lines_without_timestamp_and_empty_lines() {
+        let lines = parse_docker_logs("2026-10-22T10:00:01Z\nplain\n", "", "api");
+        assert_eq!(
+            (lines[0].ts.as_str(), lines[0].text.as_str()),
+            ("2026-10-22T10:00:01Z", "")
+        );
+        assert_eq!(
+            (lines[1].ts.as_str(), lines[1].text.as_str()),
+            ("", "plain")
+        );
+    }
+
+    #[test]
+    fn parses_docker_percentages() {
+        assert_eq!(percent(&Some("12.34%".into())), Some(12.34));
+        assert_eq!(percent(&Some("--".into())), None);
+        assert_eq!(percent(&None), None);
     }
 }
