@@ -1427,6 +1427,11 @@ async fn run_deploy(
         }
         return Ok((image, None, None));
     }
+    // Elegir el puerto y publicarlo con `docker run` van juntos: dos apps desplegándose a la vez
+    // en el mismo servidor elegían el mismo puerto libre y la segunda fallaba al arrancar.
+    // ponytail: un cerrojo para todo el agente; solo cubre un `docker run`, son segundos.
+    static PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _port_guard = PORT_LOCK.lock().await;
     let host_port = match app.kind {
         AppKind::Worker | AppKind::Cron => None,
         AppKind::Web => {
@@ -1448,6 +1453,7 @@ async fn run_deploy(
         let _ = docker(["rm", "-f", &container]).await;
         return Err(("start", e));
     }
+    drop(_port_guard);
 
     p.stage("healthcheck", "Checking the new version");
     if let Err(e) = healthcheck(req, &container, host_port).await {
