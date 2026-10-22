@@ -83,6 +83,10 @@ struct AppSpec {
     install_command: Option<String>,
     #[serde(default)]
     build_command: Option<String>,
+    /// Rutas dentro del contenedor que sobreviven a los despliegues: un
+    /// volumen de Docker con nombre por ruta (`volume_name`).
+    #[serde(default)]
+    volumes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
@@ -214,6 +218,44 @@ fn is_rel_path(s: &str) -> bool {
         })
 }
 
+/// Ruta absoluta de un volumen dentro del contenedor. Sin `,` ni `=`, que
+/// romperían el `--mount`.
+fn is_volume_path(s: &str) -> bool {
+    s.len() <= 200 && s.strip_prefix('/').is_some_and(is_rel_path)
+}
+
+/// `/var/lib/data` → `sbapp-<app>-var_lib_data`. Dos rutas que dan el mismo
+/// nombre (`/a_b` y `/a/b`) se rechazan al validar.
+fn volume_name(app_id: &str, path: &str) -> String {
+    let slug: String = path
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| match c {
+            '/' => '_',
+            '@' | '+' => '-',
+            c => c,
+        })
+        .collect();
+    format!("sbapp-{app_id}-{slug}")
+}
+
+/// Un `--mount` por volumen. La etiqueta `sb.app` (solo se pone al crearlo)
+/// es la que usa `remove_app` para encontrarlos.
+fn volume_args(app_id: &str, volumes: &[String]) -> Vec<String> {
+    volumes
+        .iter()
+        .flat_map(|path| {
+            [
+                "--mount".to_string(),
+                format!(
+                    "type=volume,source={},target={path},volume-label=sb.app={app_id}",
+                    volume_name(app_id, path)
+                ),
+            ]
+        })
+        .collect()
+}
+
 /// Comandos a medida: una línea de como mucho 1000 caracteres.
 fn is_command(s: &str) -> bool {
     !s.trim().is_empty() && s.chars().count() <= 1000 && !s.chars().any(char::is_control)
@@ -280,6 +322,15 @@ impl DeployRequest {
         }
         if !is_rel_path(&app.dockerfile_path) {
             return Err("invalid app.dockerfile_path".into());
+        }
+        if app.volumes.len() > 5 {
+            return Err("at most 5 volumes".into());
+        }
+        let mut names = std::collections::HashSet::new();
+        for v in &app.volumes {
+            if !is_volume_path(v) || !names.insert(volume_name(&app.id, v)) {
+                return Err(format!("invalid app.volumes: {v}"));
+            }
         }
         if app.kind == AppKind::Cron {
             let schedule = app
@@ -945,6 +996,7 @@ async fn start_container(
         args.push("-e".into());
         args.push(format!("PORT={}", app.port));
     }
+    args.extend(volume_args(&app.id, &app.volumes));
     args.extend(image_and_command(image, app.start_command.as_deref()));
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
@@ -1069,6 +1121,30 @@ async fn container_names(app_id: &str) -> Result<Vec<String>, String> {
     ))
 }
 
+/// Para los contenedores en marcha de la app y devuelve sus nombres.
+async fn stop_running(app_id: &str) -> Result<Vec<String>, String> {
+    let running = lines(
+        &docker([
+            "ps",
+            "--filter",
+            &format!("label=sb.app={app_id}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .await?,
+    );
+    if !running.is_empty() {
+        docker(
+            ["stop", "-t", "10"]
+                .into_iter()
+                .map(String::from)
+                .chain(running.iter().cloned()),
+        )
+        .await?;
+    }
+    Ok(running)
+}
+
 /// Para y borra los contenedores viejos de la app y deja las `keep`
 /// imágenes más recientes. Los fallos aquí no tumban el despliegue (la
 /// versión nueva ya está sirviendo), solo se registran.
@@ -1180,6 +1256,8 @@ struct CronJob {
     schedule: String,
     start_command: Option<String>,
     env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volumes: Vec<String>,
 }
 
 fn cron_file(dir: &Path, app_id: &str) -> PathBuf {
@@ -1297,6 +1375,7 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
     .into();
     args.extend(log_rotation().await);
     args.extend([String::from("--env-file"), env_path]);
+    args.extend(volume_args(app_id, &job.volumes));
     args.extend(image_and_command(&job.image, job.start_command.as_deref()));
     let result = docker(args).await.map(|_| ());
     drop(env_dir);
@@ -1410,6 +1489,7 @@ async fn run_deploy(
             schedule: app.schedule.clone().unwrap_or_default(),
             start_command: app.start_command.clone(),
             env: req.env.clone(),
+            volumes: app.volumes.clone(),
         };
         save_cron_job(Path::new(CRON_DIR), &app.id, &job).map_err(at("start"))?;
         p.stage("cleanup", "Removing old images");
@@ -1427,52 +1507,80 @@ async fn run_deploy(
         }
         return Ok((image, None, None));
     }
-    // Elegir el puerto y publicarlo con `docker run` van juntos: dos apps desplegándose a la vez
-    // en el mismo servidor elegían el mismo puerto libre y la segunda fallaba al arrancar.
-    // ponytail: un cerrojo para todo el agente; solo cubre un `docker run`, son segundos.
-    static PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _port_guard = PORT_LOCK.lock().await;
-    let host_port = match app.kind {
-        AppKind::Worker | AppKind::Cron => None,
-        AppKind::Web => {
-            let published = docker_published_ports().await.map_err(at("start"))?;
-            let free = |port: u16| {
-                !published.contains(&port)
-                    && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-            };
-            Some(
-                pick_port(free)
-                    .ok_or_else(|| ("start", "no free port in 20000-29999".to_string()))?,
-            )
-        }
+    // Con volúmenes, dos versiones a la vez escribirían en los mismos datos (una
+    // base de datos se corrompe): se para la anterior antes de arrancar la nueva
+    // y, si la nueva falla, se vuelve a arrancar. Son unos segundos sin servicio.
+    let stopped = if app.volumes.is_empty() {
+        Vec::new()
+    } else {
+        p.log("The app has volumes: stopping the previous version first");
+        stop_running(&app.id).await.map_err(at("start"))?
     };
     let container = req.container_name();
-    // Por si un intento anterior de este mismo despliegue dejó el contenedor.
-    let _ = docker(["rm", "-f", &container]).await;
-    if let Err(e) = start_container(req, &image, &container, host_port).await {
-        let _ = docker(["rm", "-f", &container]).await;
-        return Err(("start", e));
-    }
-    drop(_port_guard);
-
-    p.stage("healthcheck", "Checking the new version");
-    if let Err(e) = healthcheck(req, &container, host_port).await {
-        dump_container_logs(&container, p).await;
-        let _ = docker(["rm", "-f", &container]).await;
-        return Err(("healthcheck", e));
-    }
-
-    if let (Some(hp), Some(domain)) = (host_port, &app.domain) {
-        p.stage("switch", "Switching traffic");
-        if proxy::caddy_state().await == "running" {
-            if let Err(e) = proxy::upsert_route(&app.id, domain, &app.aliases, hp).await {
-                let _ = docker(["rm", "-f", &container]).await;
-                return Err(("switch", e));
+    let started = async {
+        // Elegir el puerto y publicarlo con `docker run` van juntos: dos apps desplegándose a la vez
+        // en el mismo servidor elegían el mismo puerto libre y la segunda fallaba al arrancar.
+        // ponytail: un cerrojo para todo el agente; solo cubre un `docker run`, son segundos.
+        static PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _port_guard = PORT_LOCK.lock().await;
+        let host_port = match app.kind {
+            AppKind::Worker | AppKind::Cron => None,
+            AppKind::Web => {
+                let published = docker_published_ports().await.map_err(at("start"))?;
+                let free = |port: u16| {
+                    !published.contains(&port)
+                        && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                };
+                Some(
+                    pick_port(free)
+                        .ok_or_else(|| ("start", "no free port in 20000-29999".to_string()))?,
+                )
             }
-        } else {
-            p.log("Proxy not installed, route not changed");
+        };
+        // Por si un intento anterior de este mismo despliegue dejó el contenedor.
+        let _ = docker(["rm", "-f", &container]).await;
+        if let Err(e) = start_container(req, &image, &container, host_port).await {
+            let _ = docker(["rm", "-f", &container]).await;
+            return Err(("start", e));
         }
-    } else if host_port.is_some() && proxy::caddy_state().await == "running" {
+        drop(_port_guard);
+
+        p.stage("healthcheck", "Checking the new version");
+        if let Err(e) = healthcheck(req, &container, host_port).await {
+            dump_container_logs(&container, p).await;
+            let _ = docker(["rm", "-f", &container]).await;
+            return Err(("healthcheck", e));
+        }
+
+        if let (Some(hp), Some(domain)) = (host_port, &app.domain) {
+            p.stage("switch", "Switching traffic");
+            if proxy::caddy_state().await == "running" {
+                if let Err(e) = proxy::upsert_route(&app.id, domain, &app.aliases, hp).await {
+                    let _ = docker(["rm", "-f", &container]).await;
+                    return Err(("switch", e));
+                }
+            } else {
+                p.log("Proxy not installed, route not changed");
+            }
+        }
+        Ok(host_port)
+    }
+    .await;
+    let host_port = match started {
+        Ok(hp) => hp,
+        Err(e) => {
+            if !stopped.is_empty() {
+                p.log("Starting the previous version again");
+                if let Err(e) = docker(["start"].into_iter().map(String::from).chain(stopped)).await
+                {
+                    p.log(&format!("could not start the previous version: {e}"));
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    if host_port.is_some() && app.domain.is_none() && proxy::caddy_state().await == "running" {
         // Se quitó el dominio: la ruta apuntaría al contenedor que se para ahora.
         if let Err(e) = proxy::delete_route(&app.id).await {
             p.log(&format!("proxy: {e}"));
@@ -1480,7 +1588,9 @@ async fn run_deploy(
     }
 
     p.stage("cleanup", "Stopping the previous version");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    if stopped.is_empty() {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
     if let Err(e) = cleanup(&app.id, &container, &image, req.keep_images, p).await {
         p.log(&format!("cleanup: {e}"));
     }
@@ -1553,10 +1663,31 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
         if proxy::caddy_state().await == "running" {
             proxy::delete_route(&req.app_id).await?;
         }
+        // Con la app se van sus datos: el panel lo avisa antes de borrarla.
+        let volumes = lines(
+            &docker([
+                "volume",
+                "ls",
+                "-q",
+                "--filter",
+                &format!("label=sb.app={}", req.app_id),
+            ])
+            .await?,
+        );
+        if !volumes.is_empty() {
+            docker(
+                ["volume", "rm"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain(volumes.iter().cloned()),
+            )
+            .await?;
+        }
         Ok::<_, String>(json!({
             "app_id": req.app_id,
             "containers_removed": containers.len(),
             "images_removed": refs.len(),
+            "volumes_removed": volumes.len(),
         }))
     }
     .await;
@@ -1718,6 +1849,41 @@ mod tests {
         }
         v["app"]["builder"] = json!("dockerfile");
         assert!(validate(v).is_err(), "install_command con Dockerfile");
+    }
+
+    #[test]
+    fn volumes_are_validated_and_mounted() {
+        assert!(validate(payload()).unwrap().app.volumes.is_empty());
+
+        let mut v = payload();
+        v["app"]["volumes"] = json!(["/var/lib/postgresql/data", "/app/uploads"]);
+        let r = validate(v.clone()).unwrap();
+        assert_eq!(
+            volume_args(APP_ID, &r.app.volumes),
+            [
+                "--mount".to_string(),
+                format!("type=volume,source=sbapp-{APP_ID}-var_lib_postgresql_data,target=/var/lib/postgresql/data,volume-label=sb.app={APP_ID}"),
+                "--mount".to_string(),
+                format!("type=volume,source=sbapp-{APP_ID}-app_uploads,target=/app/uploads,volume-label=sb.app={APP_ID}"),
+            ]
+        );
+
+        for bad in [
+            json!(["/"]),
+            json!(["data"]),
+            json!(["/a/../etc"]),
+            json!(["/a,b"]),
+            json!(["/a=b"]),
+            json!(["/a b"]),
+            json!([format!("/{}", "x".repeat(200))]),
+            json!(["/a_b", "/a/b"]),
+            json!(["/data", "/data"]),
+            json!(["/a", "/b", "/c", "/d", "/e", "/f"]),
+        ] {
+            let mut w = v.clone();
+            w["app"]["volumes"] = bad.clone();
+            assert!(validate(w).is_err(), "{bad} should be rejected");
+        }
     }
 
     #[test]
@@ -1936,6 +2102,7 @@ mod tests {
             schedule: "30 2 * * *".into(),
             start_command: Some("node job.js".into()),
             env: [("K".to_string(), "V".to_string())].into(),
+            volumes: Vec::new(),
         };
         save_cron_job(&cron_dir, APP_ID, &job).unwrap();
         job.image = format!("sbapp/{APP_ID}:bbbbbbbbbbbb");

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-23
+
+### Added
+- **Deployments**: `deploy_app` takes `app.volumes`, up to 5 absolute paths inside the container that survive deploys. Each one is a named Docker volume, `sbapp-<app>-<path>` (`/var/lib/data` becomes `sbapp-<app>-var_lib_data`), labelled `sb.app=<app>`. Cron runs mount them too.
+- **Deployments**: An app with volumes stops its previous version before starting the new one, so two versions never write to the same data. If the new one fails to start, pass its healthcheck or get its route, the previous one is started again. Expect a few seconds of downtime on each deploy of these apps.
+- **Deployments**: `remove_app` also deletes the app's volumes and reports `volumes_removed`.
+
 ## [0.5.1] - 2026-10-22
 
 ### Fixed
