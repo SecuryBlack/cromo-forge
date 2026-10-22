@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-23
+
+### Added
+- **Deployments**: `deploy_app` takes `registry_image` instead of `source` or `image`: the image is pulled from its registry and nothing is built. This is what one-click templates use. With a moving tag (`:3`), the version it replaces is removed after a successful deploy.
+- **Deployments**: `sidecars` (up to 5) run next to the app, such as a template's database: `name`, `image`, `env`, `volumes` and `command`. They share a `sbapp-<app>` network with the app, which reaches each one by its `name`. A sidecar is only recreated when its spec or image changes, so the database keeps running across deploys. Its volumes are named `sbapp-<app>-<name>-<path>`. Cron apps cannot have sidecars.
+- **Deployments**: `remove_app` also removes the sidecars, their volumes and the network.
+
 ## [0.6.0] - 2026-10-23
 
 ### Added
