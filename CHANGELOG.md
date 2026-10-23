@@ -5,7 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.1] - 2026-10-23
+
+### Added
+- **Signed commands (S4)**: Before running each order, the agent reports whether its signature checks out (`sig:ok` or the reason it does not) (sb-agent-core 0.4.2). Unsigned orders are still accepted: this only measures the fleet before signatures become mandatory.
 
 ### Fixed
 - **Logs**: Old log files are deleted again; only the last 7 days are kept (sb-agent-core 0.4.1). Rotated files (`cromoforge.log.YYYY-MM-DD`) were never removed.
