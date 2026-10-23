@@ -259,7 +259,7 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "cromoforge"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "flate2",
  "reqwest",
@@ -2002,8 +2002,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sb-agent-core"
-version = "0.4.1"
-source = "git+https://github.com/securyblack/sb-agent-core?tag=v0.4.1#45bbc2ab687e6ce1e3d75da71888e6aa49b000ff"
+version = "0.4.2"
+source = "git+https://github.com/securyblack/sb-agent-core?tag=v0.4.2#646b6a4892c519bac6cdbd67dcb07a1f3abd0f3b"
 dependencies = [
  "base64",
  "crossterm 0.28.1",
