@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Logs**: Old log files are deleted again; only the last 7 days are kept (sb-agent-core 0.4.1). Rotated files (`cromoforge.log.YYYY-MM-DD`) were never removed.
 
+### Security
+- **Dependencies**: rustls 0.23.46 (TLS 1.3 handshake messages were accepted across encryption level boundaries, RUSTSEC fixed in 0.23.45).
+
 ## [0.7.0] - 2026-10-23
 
 ### Added
