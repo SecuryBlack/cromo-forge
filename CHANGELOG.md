@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-29
+
+### Security
+- **Signed commands (S4)**: CromoForge now only runs orders signed by SecuryBlack (sb-agent-core 0.5.0). Unsigned orders, orders with a bad signature and expired orders are rejected before they reach the agent, so someone who gets hold of the server's queue or token can no longer deploy apps on it. CromoForge is the first agent to require signatures; the others still only report them.
+
 ## [0.7.1] - 2026-10-23
 
 ### Added
