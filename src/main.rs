@@ -53,6 +53,8 @@ async fn run(mut shutdown: oneshot::Receiver<()>) {
         sb_agent_core::command_intake::SigningContext {
             server_token: cfg.token.clone().unwrap_or_default(),
             target_agent: AGENT_NAME.to_string(),
+            // S4: primer agente que exige la firma (medición del 29-10: 12/12 sig:ok).
+            require_signature: true,
         },
     );
 
