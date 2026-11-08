@@ -1,4 +1,5 @@
-//! Despliegues desde git (Fase 1): `deploy_app` y `remove_app`.
+//! Despliegues desde git (Fase 1): `deploy_app`, `remove_app` y
+//! `remove_sidecar`.
 //!
 //! El camino de `deploy_app` es fetch (tarball de GitHub) → build (Railpack
 //! o el Dockerfile del repo, contra el BuildKit `sb-buildkit`) → start → healthcheck → switch (ruta de
@@ -161,7 +162,7 @@ fn default_dockerfile_path() -> String {
 }
 
 /// UUID en minúsculas (`sbapp/<id>` va en un nombre de imagen, que no admite mayúsculas).
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36
         && s.char_indices().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',
@@ -548,7 +549,7 @@ where
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn lines(s: &str) -> Vec<String> {
+pub(crate) fn lines(s: &str) -> Vec<String> {
     s.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -732,11 +733,11 @@ fn image_and_command(image: &str, start_command: Option<&str>) -> Vec<String> {
 
 /// Directorio de trabajo del build; se borra al soltarse (también si la
 /// orden caduca). En `/var/tmp` y no en `/tmp`, que suele ser tmpfs.
-struct WorkDir(PathBuf);
+pub(crate) struct WorkDir(pub(crate) PathBuf);
 
 impl WorkDir {
     /// `/var/tmp/cromoforge-<kind>-<deployment_id>`, modo 0700.
-    fn new(kind: &str, deployment_id: &str) -> Result<Self, String> {
+    pub(crate) fn new(kind: &str, deployment_id: &str) -> Result<Self, String> {
         let base = if cfg!(unix) {
             PathBuf::from("/var/tmp")
         } else {
@@ -1102,7 +1103,7 @@ fn log_rotation_args(driver: &str) -> Vec<String> {
         .into()
 }
 
-async fn log_rotation() -> Vec<String> {
+pub(crate) async fn log_rotation() -> Vec<String> {
     let driver = docker(["info", "--format", "{{.LoggingDriver}}"])
         .await
         .unwrap_or_default();
@@ -1119,7 +1120,7 @@ fn env_file_content(env: &BTreeMap<String, String>, skip_port: bool) -> String {
         .collect()
 }
 
-fn write_private(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn write_private(path: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -1593,7 +1594,7 @@ async fn run_cron_job(app_id: &str) -> Result<(), String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Un candado por `app.id`: dos órdenes de la misma app van en fila.
-fn app_lock(app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn app_lock(app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     // ponytail: el mapa no se poda nunca; una entrada por app, crece con las apps del servidor.
     LOCKS
@@ -1823,6 +1824,75 @@ async fn run_deploy(
     }
 
     Ok((image, Some(container), host_port))
+}
+
+#[derive(Deserialize)]
+struct RemoveSidecarRequest {
+    app_id: String,
+    name: String,
+    #[serde(default)]
+    volumes: Vec<String>,
+}
+
+/// Quita un auxiliar y sus volúmenes, con sus datos (el panel lo avisa antes).
+/// Un auxiliar que solo desaparece del payload de `deploy_app` conserva el
+/// volumen: al volver a añadirlo, Postgres arrancaría con la contraseña vieja.
+/// Los volúmenes llegan por ruta, igual que al montarlos, así que el nombre es
+/// exacto y nunca toca los de la app (`sbapp-<app>-db-x` puede ser de los dos).
+pub async fn remove_sidecar(payload: Value, _tx: ProgressSender) -> CommandOutcome {
+    let req: RemoveSidecarRequest = match serde_json::from_value(payload) {
+        Ok(r) => r,
+        Err(e) => return CommandOutcome::failed(format!("invalid payload: {e}")),
+    };
+    if let Err(e) = req.validate() {
+        return CommandOutcome::failed(e);
+    }
+    let lock = app_lock(&req.app_id);
+    let _guard = lock.lock().await;
+
+    let result = async {
+        // Sin el contenedor (ya lo quitó un deploy_app sin él) también vale.
+        let _ = docker(["rm", "-f", &sidecar_container(&req.app_id, &req.name)]).await;
+        let mut removed = 0;
+        for name in req.volume_names() {
+            match docker(["volume", "rm", &name]).await {
+                Ok(_) => removed += 1,
+                Err(e) if e.to_lowercase().contains("no such volume") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok::<_, String>(
+            json!({ "app_id": req.app_id, "name": req.name, "volumes_removed": removed }),
+        )
+    }
+    .await;
+    match result {
+        Ok(v) => CommandOutcome::ok(v.to_string()),
+        Err(e) => CommandOutcome::failed(e),
+    }
+}
+
+impl RemoveSidecarRequest {
+    fn owner(&self) -> String {
+        format!("{}-{}", self.app_id, self.name)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !is_uuid(&self.app_id) {
+            return Err("invalid app_id".into());
+        }
+        if !is_app_name(&self.name) || self.name.len() > 20 {
+            return Err("invalid name".into());
+        }
+        check_volumes(&self.owner(), &self.volumes)
+    }
+
+    fn volume_names(&self) -> Vec<String> {
+        self.volumes
+            .iter()
+            .map(|v| volume_name(&self.owner(), v))
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -2122,6 +2192,30 @@ mod tests {
             let mut w = v.clone();
             w["app"]["volumes"] = bad.clone();
             assert!(validate(w).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn remove_sidecar_targets_exact_volumes() {
+        let ok: RemoveSidecarRequest = serde_json::from_value(json!({
+            "app_id": APP_ID, "name": "db", "volumes": ["/var/lib/postgresql/data"]
+        }))
+        .unwrap();
+        assert!(ok.validate().is_ok());
+        // El mismo nombre con el que se montó (volume_args con Some("db")).
+        assert_eq!(
+            ok.volume_names(),
+            vec![format!("sbapp-{APP_ID}-db-var_lib_postgresql_data")]
+        );
+        for bad in [
+            json!({ "app_id": "x", "name": "db", "volumes": [] }),
+            json!({ "app_id": APP_ID, "name": "DB", "volumes": [] }),
+            json!({ "app_id": APP_ID, "name": "x".repeat(21), "volumes": [] }),
+            json!({ "app_id": APP_ID, "name": "db", "volumes": ["data"] }),
+            json!({ "app_id": APP_ID, "name": "db", "volumes": ["/../etc"] }),
+        ] {
+            let r: RemoveSidecarRequest = serde_json::from_value(bad.clone()).unwrap();
+            assert!(r.validate().is_err(), "{bad} should be rejected");
         }
     }
 

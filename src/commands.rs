@@ -125,6 +125,10 @@ pub fn register(registry: &CommandRegistry) {
     // Despliegues desde git (Fase 1). Asíncronos: sus hijos mueren si la orden caduca.
     registry.register("deploy_app", crate::deploy::deploy_app);
     registry.register("remove_app", crate::deploy::remove_app);
+    registry.register("remove_sidecar", crate::deploy::remove_sidecar);
+    // Bases de datos sueltas, sin app.
+    registry.register("database_run", crate::databases::database_run);
+    registry.register("database_remove", crate::databases::database_remove);
     registry.register("proxy_status", crate::proxy::proxy_status);
     registry.register("proxy_install", crate::proxy::proxy_install);
 }

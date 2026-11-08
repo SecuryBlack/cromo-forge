@@ -37,6 +37,7 @@ CromoForge receives commands from the SecuryBlack panel through the companion ag
 - **GitHub app deploys (early access, Linux):** `deploy_app` downloads the commit tarball from GitHub, builds it with [Railpack](https://github.com/railwayapp/railpack) against a resource-capped BuildKit container (`sb-buildkit`), starts the new container, healthchecks it and only then switches traffic and removes the old one. Deploys can be triggered on every push from the panel.
 - **App types:** `web` (HTTP healthcheck, routed through Caddy), `worker` (30 s stability check) and `cron` (5-field UTC schedule; a run is skipped while the previous one is still going).
 - **Rollback:** redeploys an existing `sbapp/<app>` image without rebuilding; the newest `keep_images` images are kept.
+- **Databases:** PostgreSQL or Redis next to an app (a sidecar on its private network) or standalone, listening only on `127.0.0.1` of the server. Removing one also removes its volume.
 - **Custom domains:** an SB-managed Caddy (`sb-caddy`) publishes web apps on their domain with automatic HTTPS from Let's Encrypt.
 - **Secrets:** app environment variables reach the container through a `0600` env file that is deleted right after `docker run`, never through argv.
 - **BuildKit cache cleanup:** the build cache is pruned after each build to a size based on free disk.

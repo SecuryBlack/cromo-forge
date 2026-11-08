@@ -8,6 +8,7 @@
 mod commands;
 mod config;
 mod cron;
+mod databases;
 mod deploy;
 mod proxy;
 
