@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-11-08
+
+### Added
+- **Deployments**: `remove_sidecar` removes one sidecar of an app together with its volumes and data: `app_id`, `name` and the `volumes` it mounted. A sidecar that is only dropped from `deploy_app` keeps its volume, so a database added back later would start with the old data and password.
+- **Standalone databases**: `database_run` starts a PostgreSQL 17 or Redis 7 that belongs to no app, listening only on `127.0.0.1:<port>` of the server (reach it from outside through an SSH tunnel): `id`, `engine`, `port` and its password in `env.PASSWORD`. The container is `sbdb-<id>` and its data lives in the `sbdb-<id>-data` volume. PostgreSQL loads `pg_stat_statements` and Redis saves to disk and requires the password. Running it again starts the same database. `database_remove` removes the container and its volume.
+
 ## [0.7.1] - 2026-10-23
 
 ### Added
