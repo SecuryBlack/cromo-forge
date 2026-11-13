@@ -1772,13 +1772,13 @@ async fn run_deploy(
 
         if let (Some(hp), Some(domain)) = (host_port, &app.domain) {
             p.stage("switch", "Switching traffic");
-            if proxy::caddy_state().await == "running" {
-                if let Err(e) = proxy::upsert_route(&app.id, domain, &app.aliases, hp).await {
+            match proxy::set_route(&app.id, domain, &app.aliases, hp).await {
+                Ok(true) => {}
+                Ok(false) => p.log("Proxy not installed, route not changed"),
+                Err(e) => {
                     let _ = docker(["rm", "-f", &container]).await;
                     return Err(("switch", e));
                 }
-            } else {
-                p.log("Proxy not installed, route not changed");
             }
         }
         Ok(host_port)
@@ -1798,9 +1798,9 @@ async fn run_deploy(
         }
     };
 
-    if host_port.is_some() && app.domain.is_none() && proxy::caddy_state().await == "running" {
+    if host_port.is_some() && app.domain.is_none() {
         // Se quitó el dominio: la ruta apuntaría al contenedor que se para ahora.
-        if let Err(e) = proxy::delete_route(&app.id).await {
+        if let Err(e) = proxy::remove_route(&app.id).await {
             p.log(&format!("proxy: {e}"));
         }
     }
@@ -1968,9 +1968,7 @@ pub async fn remove_app(payload: Value, _tx: ProgressSender) -> CommandOutcome {
             )
             .await?;
         }
-        if proxy::caddy_state().await == "running" {
-            proxy::delete_route(&req.app_id).await?;
-        }
+        proxy::remove_route(&req.app_id).await?;
         // Con la app se van sus datos: el panel lo avisa antes de borrarla.
         let volumes = lines(
             &docker([
