@@ -5,9 +5,14 @@
 //!
 //! Órdenes: `proxy_status` y `proxy_install` (ver el contrato de la Fase 1
 //! en `sb-wiki/Tecnica/Fase 1 - Contrato de despliegues.md`).
+//!
+//! Si CupraFlow está instalado (existe su socket local), él es el dueño de
+//! Caddy: rutas, `proxy_status` y `proxy_install` van por él y aquí no se
+//! toca Caddy. Si no, todo sigue como antes. Contrato en
+//! `sb-wiki/Tecnica/CupraFlow v1 - contrato.md`.
 
 use crate::deploy::{docker, local_http};
-use sb_agent_core::command_intake::{CommandOutcome, ProgressSender};
+use sb_agent_core::command_intake::{CommandOutcome, CommandResponse, ProgressSender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -20,7 +25,7 @@ const ADMIN: &str = "http://127.0.0.1:2019";
 const SERVER: &str = "sb";
 
 /// "running" | "stopped" | "absent", tal cual lo pide `proxy_status`.
-pub async fn caddy_state() -> &'static str {
+async fn caddy_state() -> &'static str {
     match docker(["inspect", "-f", "{{.State.Running}}", CADDY_CONTAINER]).await {
         Ok(s) if s == "true" => "running",
         Ok(_) => "stopped",
@@ -49,7 +54,7 @@ fn yes() -> bool {
 /// Los alias con redirección van en una subruta delante, dentro de la misma
 /// ruta, así que la app sigue teniendo un solo `@id`. Todos los hosts están
 /// en el `match` de fuera, que es de donde Caddy saca los certificados.
-pub fn route_json(app_id: &str, domain: &str, aliases: &[Alias], host_port: u16) -> Value {
+fn route_json(app_id: &str, domain: &str, aliases: &[Alias], host_port: u16) -> Value {
     let proxy = json!({
         "handler": "reverse_proxy",
         "upstreams": [{ "dial": format!("127.0.0.1:{host_port}") }]
@@ -101,7 +106,7 @@ fn initial_config() -> Value {
 
 /// Crea o sustituye la ruta de la app. PATCH sobre `/id/...` reemplaza la
 /// ruta existente en sitio; si no existe aún, se añade al final.
-pub async fn upsert_route(
+async fn upsert_route(
     app_id: &str,
     domain: &str,
     aliases: &[Alias],
@@ -139,7 +144,7 @@ pub async fn upsert_route(
 }
 
 /// Borra la ruta de la app. Que no exista no es un error.
-pub async fn delete_route(app_id: &str) -> Result<(), String> {
+async fn delete_route(app_id: &str) -> Result<(), String> {
     let client = local_http(Duration::from_secs(10))?;
     let resp = client
         .delete(format!("{ADMIN}/id/{}", route_id(app_id)))
@@ -153,6 +158,113 @@ pub async fn delete_route(app_id: &str) -> Result<(), String> {
     } else {
         Err(format!("Caddy admin API returned {status}: {text}"))
     }
+}
+
+/// Ruta en el formato de CupraFlow. Caddy acaba con el mismo JSON que `route_json`.
+fn cupraflow_route(app_id: &str, domain: &str, aliases: &[Alias], host_port: u16) -> Value {
+    let hosts: Vec<&str> = std::iter::once(domain)
+        .chain(aliases.iter().map(|a| a.domain.as_str()))
+        .collect();
+    let redirect_hosts: Vec<&str> = aliases
+        .iter()
+        .filter(|a| a.redirect)
+        .map(|a| a.domain.as_str())
+        .collect();
+    json!({
+        "id": app_id,
+        "hosts": hosts,
+        "redirect_hosts": redirect_hosts,
+        "upstreams": [{ "dial": format!("127.0.0.1:{host_port}") }],
+    })
+}
+
+/// Resultado de una orden de CupraFlow: su `stdout` (JSON) o su `stderr`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn cupraflow_result(resp: CommandResponse) -> Result<Value, String> {
+    if !resp.success {
+        return Err(format!("CupraFlow: {}", resp.stderr.trim()));
+    }
+    serde_json::from_str(&resp.stdout).map_err(|e| format!("CupraFlow: bad reply: {e}"))
+}
+
+/// Manda la orden al socket local de CupraFlow. `None` si no está instalado
+/// (no hay socket); con socket y sin respuesta es un error: no se vuelve a
+/// Caddy por cuenta propia, para que las rutas no tengan dos dueños.
+#[cfg(unix)]
+async fn via_cupraflow(
+    command_type: &str,
+    payload: Value,
+    timeout_secs: u32,
+) -> Option<Result<Value, String>> {
+    use sb_agent_core::command_intake::{default_socket_path, CommandEnvelope};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const AGENT: &str = "cupraflow-local";
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if !default_socket_path(AGENT).exists() {
+        return None;
+    }
+    // CupraFlow no repite un `command_id` ya visto: tiene que ser único.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let envelope = CommandEnvelope {
+        command_id: format!(
+            "cromoforge-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+        command_type: command_type.to_string(),
+        payload,
+        timeout_secs,
+        ..Default::default()
+    };
+    let sent = tokio::task::spawn_blocking(move || {
+        sb_agent_core::command_intake_client::send_command(AGENT, &envelope, |_| {})
+    })
+    .await;
+    Some(match sent {
+        Ok(Ok(resp)) => cupraflow_result(resp),
+        Ok(Err(e)) => Err(format!("CupraFlow not responding: {e}")),
+        Err(e) => Err(format!("CupraFlow not responding: {e}")),
+    })
+}
+
+#[cfg(not(unix))]
+async fn via_cupraflow(_: &str, _: Value, _: u32) -> Option<Result<Value, String>> {
+    None
+}
+
+/// Publica la ruta de la app. `Ok(false)`: Caddy no está en marcha y no se
+/// ha tocado nada.
+pub async fn set_route(
+    app_id: &str,
+    domain: &str,
+    aliases: &[Alias],
+    host_port: u16,
+) -> Result<bool, String> {
+    let route = cupraflow_route(app_id, domain, aliases, host_port);
+    if let Some(r) = via_cupraflow("route_set", json!({ "route": route }), 30).await {
+        return r.map(|v| v["applied"] == true);
+    }
+    if caddy_state().await != "running" {
+        return Ok(false);
+    }
+    upsert_route(app_id, domain, aliases, host_port)
+        .await
+        .map(|_| true)
+}
+
+/// Quita la ruta de la app. `Ok(false)`: Caddy no está en marcha.
+pub async fn remove_route(app_id: &str) -> Result<bool, String> {
+    if let Some(r) = via_cupraflow("route_remove", json!({ "id": app_id }), 30).await {
+        return r.map(|v| v["applied"] == true);
+    }
+    if caddy_state().await != "running" {
+        return Ok(false);
+    }
+    delete_route(app_id).await.map(|_| true)
 }
 
 /// Procesos escuchando en :80 y :443 según `ss -ltnpH`. "unknown" si `ss`
@@ -206,7 +318,11 @@ async fn status_json() -> Result<Value, String> {
 }
 
 pub async fn proxy_status(_payload: Value, _progress: ProgressSender) -> CommandOutcome {
-    match status_json().await {
+    let result = match via_cupraflow("proxy_status", json!({}), 30).await {
+        Some(r) => r,
+        None => status_json().await,
+    };
+    match result {
         Ok(v) => CommandOutcome::ok(v.to_string()),
         Err(e) => CommandOutcome::failed(e),
     }
@@ -293,7 +409,11 @@ async fn install() -> Result<Value, String> {
 }
 
 pub async fn proxy_install(_payload: Value, _progress: ProgressSender) -> CommandOutcome {
-    match install().await {
+    let result = match via_cupraflow("proxy_install", json!({}), 300).await {
+        Some(r) => r,
+        None => install().await,
+    };
+    match result {
         Ok(v) => CommandOutcome::ok(v.to_string()),
         Err(e) => CommandOutcome::failed(e),
     }
@@ -348,6 +468,59 @@ mod tests {
         // Solo alias que sirven la app: sin subruta.
         let r = route_json("x", "ejemplo.com", &aliases[1..], 20001);
         assert_eq!(r["handle"][0]["handler"], "reverse_proxy");
+    }
+
+    #[test]
+    fn cupraflow_route_matches_route_json() {
+        let aliases = [
+            Alias {
+                domain: "www.ejemplo.com".into(),
+                redirect: true,
+            },
+            Alias {
+                domain: "otro.com".into(),
+                redirect: false,
+            },
+        ];
+        let r = cupraflow_route("app-1", "ejemplo.com", &aliases, 20001);
+        assert_eq!(
+            r,
+            json!({
+                "id": "app-1",
+                "hosts": ["ejemplo.com", "www.ejemplo.com", "otro.com"],
+                "redirect_hosts": ["www.ejemplo.com"],
+                "upstreams": [{ "dial": "127.0.0.1:20001" }],
+            })
+        );
+        // Mismos hosts que la ruta que se escribe directamente en Caddy.
+        assert_eq!(
+            route_json("app-1", "ejemplo.com", &aliases, 20001)["match"][0]["host"],
+            r["hosts"]
+        );
+    }
+
+    #[test]
+    fn cupraflow_result_parses_reply() {
+        let resp = |success: bool, stdout: &str, stderr: &str| CommandResponse {
+            command_id: "x".into(),
+            success,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit_code: 0,
+            duration_ms: 1,
+        };
+        let ok = cupraflow_result(resp(true, r#"{"id":"a","applied":false}"#, "")).unwrap();
+        assert_eq!(ok["applied"], false);
+        assert_eq!(
+            cupraflow_result(resp(
+                false,
+                "",
+                "invalid route
+"
+            )),
+            Err("CupraFlow: invalid route".into())
+        );
+        assert!(cupraflow_result(resp(true, "not json", "")).is_err());
     }
 
     #[test]

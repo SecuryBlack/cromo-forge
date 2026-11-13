@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-13
+
+### Changed
+- **Proxy**: When CupraFlow 0.2.0 or newer is installed on the server (its local socket `/run/sb-agent/cupraflow-local-cmd.sock` exists), app routes, `proxy_status` and `proxy_install` go through CupraFlow, which owns SecuryBlack's Caddy. CromoForge no longer touches Caddy on that server. If CupraFlow's socket is there but it does not answer, the route change fails instead of writing to Caddy directly. Without CupraFlow nothing changes.
+
 ## [0.7.2] - 2026-11-08
 
 ### Added
