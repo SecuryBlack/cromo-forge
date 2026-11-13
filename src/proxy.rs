@@ -160,8 +160,22 @@ async fn delete_route(app_id: &str) -> Result<(), String> {
     }
 }
 
-/// Ruta en el formato de CupraFlow. Caddy acaba con el mismo JSON que `route_json`.
-fn cupraflow_route(app_id: &str, domain: &str, aliases: &[Alias], host_port: u16) -> Value {
+/// Otros servidores de la app (`peers` de `deploy_app`) y el healthcheck que
+/// CupraFlow comprueba en el local cuando los hay.
+pub struct Peers<'a> {
+    pub peers: &'a [String],
+    pub health_path: &'a str,
+}
+
+/// Ruta en el formato de CupraFlow. Sin compañeros, Caddy acaba con el mismo
+/// JSON que `route_json`.
+fn cupraflow_route(
+    app_id: &str,
+    domain: &str,
+    aliases: &[Alias],
+    host_port: u16,
+    peers: &Peers,
+) -> Value {
     let hosts: Vec<&str> = std::iter::once(domain)
         .chain(aliases.iter().map(|a| a.domain.as_str()))
         .collect();
@@ -170,12 +184,17 @@ fn cupraflow_route(app_id: &str, domain: &str, aliases: &[Alias], host_port: u16
         .filter(|a| a.redirect)
         .map(|a| a.domain.as_str())
         .collect();
-    json!({
+    let mut route = json!({
         "id": app_id,
         "hosts": hosts,
         "redirect_hosts": redirect_hosts,
         "upstreams": [{ "dial": format!("127.0.0.1:{host_port}") }],
-    })
+    });
+    if !peers.peers.is_empty() {
+        route["peers"] = json!(peers.peers);
+        route["health"] = json!({ "path": peers.health_path });
+    }
+    route
 }
 
 /// Resultado de una orden de CupraFlow: su `stdout` (JSON) o su `stderr`.
@@ -237,16 +256,20 @@ async fn via_cupraflow(_: &str, _: Value, _: u32) -> Option<Result<Value, String
 }
 
 /// Publica la ruta de la app. `Ok(false)`: Caddy no está en marcha y no se
-/// ha tocado nada.
+/// ha tocado nada. Los compañeros solo los entiende CupraFlow (>= 0.3).
 pub async fn set_route(
     app_id: &str,
     domain: &str,
     aliases: &[Alias],
     host_port: u16,
+    peers: &Peers<'_>,
 ) -> Result<bool, String> {
-    let route = cupraflow_route(app_id, domain, aliases, host_port);
+    let route = cupraflow_route(app_id, domain, aliases, host_port, peers);
     if let Some(r) = via_cupraflow("route_set", json!({ "route": route }), 30).await {
         return r.map(|v| v["applied"] == true);
+    }
+    if !peers.peers.is_empty() {
+        tracing::warn!(app_id, "peers need CupraFlow: route set without them");
     }
     if caddy_state().await != "running" {
         return Ok(false);
@@ -482,7 +505,11 @@ mod tests {
                 redirect: false,
             },
         ];
-        let r = cupraflow_route("app-1", "ejemplo.com", &aliases, 20001);
+        let none = Peers {
+            peers: &[],
+            health_path: "/",
+        };
+        let r = cupraflow_route("app-1", "ejemplo.com", &aliases, 20001, &none);
         assert_eq!(
             r,
             json!({
@@ -497,6 +524,21 @@ mod tests {
             route_json("app-1", "ejemplo.com", &aliases, 20001)["match"][0]["host"],
             r["hosts"]
         );
+    }
+
+    #[test]
+    fn cupraflow_route_with_peers() {
+        let peers = [
+            "203.0.113.7".to_string(),
+            "nodo2.ejemplo.com:8443".to_string(),
+        ];
+        let p = Peers {
+            peers: &peers,
+            health_path: "/health",
+        };
+        let r = cupraflow_route("app-1", "ejemplo.com", &[], 20001, &p);
+        assert_eq!(r["peers"], json!(["203.0.113.7", "nodo2.ejemplo.com:8443"]));
+        assert_eq!(r["health"], json!({ "path": "/health" }));
     }
 
     #[test]
