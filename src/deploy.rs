@@ -1170,14 +1170,20 @@ async fn healthcheck(
     };
 
     let url = format!("http://127.0.0.1:{hp}{}", req.app.healthcheck_path);
+    // Con compañeros, CupraFlow solo da por sano un 2xx: se exige ya aquí,
+    // si de verdad se van a usar (hay dominio y CupraFlow).
+    let strict = !req.peers.is_empty() && req.app.domain.is_some() && proxy::cupraflow_installed();
     let timeout = req.app.healthcheck_timeout_secs;
     let client = local_http(Duration::from_secs(5))?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         let last = match client.get(&url).send().await {
-            // Con compañeros, CupraFlow solo da por sano un 2xx: se exige ya aquí.
             Ok(r) if r.status().is_success() => return Ok(()),
-            Ok(r) if req.peers.is_empty() && !r.status().is_server_error() => return Ok(()),
+            Ok(r) if !strict && !r.status().is_server_error() => return Ok(()),
+            Ok(r) if strict && !r.status().is_server_error() => format!(
+                "HTTP {} (with peers, CupraFlow only counts a 2xx as healthy)",
+                r.status()
+            ),
             Ok(r) => format!("HTTP {}", r.status()),
             Err(e) => e.without_url().to_string(),
         };

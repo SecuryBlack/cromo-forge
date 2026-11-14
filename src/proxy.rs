@@ -215,12 +215,12 @@ async fn via_cupraflow(
     payload: Value,
     timeout_secs: u32,
 ) -> Option<Result<Value, String>> {
-    use sb_agent_core::command_intake::{default_socket_path, CommandEnvelope};
+    use sb_agent_core::command_intake::CommandEnvelope;
     use std::sync::atomic::{AtomicU64, Ordering};
     const AGENT: &str = "cupraflow-local";
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    if !default_socket_path(AGENT).exists() {
+    if !cupraflow_installed() {
         return None;
     }
     // CupraFlow no repite un `command_id` ya visto: tiene que ser único.
@@ -248,6 +248,18 @@ async fn via_cupraflow(
         Ok(Err(e)) => Err(format!("CupraFlow not responding: {e}")),
         Err(e) => Err(format!("CupraFlow not responding: {e}")),
     })
+}
+
+/// CupraFlow está instalado si existe su socket local (solo Linux).
+pub fn cupraflow_installed() -> bool {
+    #[cfg(unix)]
+    {
+        sb_agent_core::command_intake::default_socket_path("cupraflow-local").exists()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(not(unix))]
