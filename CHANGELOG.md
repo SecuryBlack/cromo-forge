@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-14
+
+### Added
+- **Peers**: `deploy_app` takes an optional `peers` list (IP or name, optional `host:port`) with the app's other servers. CromoForge passes them to CupraFlow 0.3.0 or newer in `route_set`, together with the app's `healthcheck_path`, so the server forwards visitors to a healthy peer while the local container is down. Without `peers` nothing changes; without CupraFlow they are ignored with a warning.
+
+### Changed
+- **Healthcheck**: when peers are actually used (`peers` given, the app has a domain and CupraFlow is installed), the deploy healthcheck needs a 2xx answer, since CupraFlow's active check counts nothing else as healthy, and the error says so. Otherwise it keeps accepting anything below 500.
+
 ## [0.8.1] - 2026-11-14
 
 ### Security

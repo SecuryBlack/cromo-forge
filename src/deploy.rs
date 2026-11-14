@@ -143,6 +143,10 @@ struct DeployRequest {
     env: BTreeMap<String, String>,
     #[serde(default = "default_keep_images")]
     keep_images: usize,
+    /// Otros servidores de la app (IP o nombre, `host:puerto` opcional), sin
+    /// este. Vacío = un solo nodo, como siempre. Se pasan a CupraFlow.
+    #[serde(default)]
+    peers: Vec<String>,
 }
 
 fn default_app_port() -> u16 {
@@ -331,8 +335,18 @@ fn is_token(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+/// Un compañero de `peers`: IP, nombre o `host:puerto` (CupraFlow valida el resto).
+fn is_peer(s: &str) -> bool {
+    (1..=262).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+}
+
 impl DeployRequest {
     fn validate(&mut self) -> Result<(), String> {
+        if self.peers.len() > 10 || !self.peers.iter().all(|p| is_peer(p)) {
+            return Err("invalid peers".into());
+        }
         let app = &mut self.app;
         if !is_uuid(&self.deployment_id) {
             return Err("invalid deployment_id".into());
@@ -1156,12 +1170,20 @@ async fn healthcheck(
     };
 
     let url = format!("http://127.0.0.1:{hp}{}", req.app.healthcheck_path);
+    // Con compañeros, CupraFlow solo da por sano un 2xx: se exige ya aquí,
+    // si de verdad se van a usar (hay dominio y CupraFlow).
+    let strict = !req.peers.is_empty() && req.app.domain.is_some() && proxy::cupraflow_installed();
     let timeout = req.app.healthcheck_timeout_secs;
     let client = local_http(Duration::from_secs(5))?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         let last = match client.get(&url).send().await {
-            Ok(r) if !r.status().is_server_error() => return Ok(()),
+            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) if !strict && !r.status().is_server_error() => return Ok(()),
+            Ok(r) if strict && !r.status().is_server_error() => format!(
+                "HTTP {} (with peers, CupraFlow only counts a 2xx as healthy)",
+                r.status()
+            ),
             Ok(r) => format!("HTTP {}", r.status()),
             Err(e) => e.without_url().to_string(),
         };
@@ -1772,7 +1794,11 @@ async fn run_deploy(
 
         if let (Some(hp), Some(domain)) = (host_port, &app.domain) {
             p.stage("switch", "Switching traffic");
-            match proxy::set_route(&app.id, domain, &app.aliases, hp).await {
+            let peers = proxy::Peers {
+                peers: &req.peers,
+                health_path: &app.healthcheck_path,
+            };
+            match proxy::set_route(&app.id, domain, &app.aliases, hp, &peers).await {
                 Ok(true) => {}
                 Ok(false) => p.log("Proxy not installed, route not changed"),
                 Err(e) => {
@@ -2109,6 +2135,15 @@ mod tests {
             *v.pointer_mut(ptr).unwrap() = bad.clone();
             assert!(validate(v).is_err(), "{ptr} = {bad} should be rejected");
         }
+
+        for peers in [json!(["a b"]), json!([""]), json!(vec!["1.2.3.4"; 11])] {
+            let mut v = payload();
+            v["peers"] = peers.clone();
+            assert!(validate(v).is_err(), "peers {peers} should be rejected");
+        }
+        let mut v = payload();
+        v["peers"] = json!(["203.0.113.7", "nodo2.ejemplo.com:8443", "[2001:db8::1]"]);
+        assert_eq!(validate(v).unwrap().peers.len(), 3);
 
         for key in ["1ABC", "A-B", "A B", ""] {
             let mut v = payload();
