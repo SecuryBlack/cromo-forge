@@ -43,7 +43,7 @@ CromoForge receives commands from the SecuryBlack panel through the companion ag
 - **BuildKit cache cleanup:** the build cache is pruned after each build to a size based on free disk.
 - **Docker:** list, start, stop and restart containers, and tail their logs.
 - **PostgreSQL:** connection test, metrics (connections, size, cache hit, slow queries, bloat, unused indexes) and actions (cancel/terminate backends, `VACUUM`, `REINDEX CONCURRENTLY`).
-- **Signed commands:** ed25519-signed commands from the SecuryBlack API are verified (expiry and replay protection). During the transition, unsigned or invalid commands are still accepted with a warning.
+- **Signed commands:** ed25519-signed commands from the SecuryBlack API are verified (expiry and replay protection). Unsigned or invalid commands are rejected (since 0.10.0).
 
 ---
 
